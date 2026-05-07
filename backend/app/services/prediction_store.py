@@ -177,20 +177,29 @@ class PredictionStore:
         return written
 
     async def get_latest_predictions(
-        self, market: str, top_n: int = 100
+        self,
+        market: str,
+        top_n: int = 100,
+        symbol: str | None = None,
+        forward_days: int | None = None,
     ) -> list[dict]:
         """Get latest predictions for a market, sorted by rank_score desc.
 
         Finds the most recent prediction_date for the given market,
         then returns up to top_n predictions from that date.
+        Filters by forward_days and/or symbol when provided.
         """
         factory = get_session_factory()
 
         async with factory() as session:
             # Find latest prediction date for this market
+            date_filters = [StockPrediction.market == market]
+            if forward_days is not None:
+                date_filters.append(StockPrediction.forward_days == forward_days)
+
             latest_date_stmt = (
                 select(func.max(StockPrediction.prediction_date))
-                .where(StockPrediction.market == market)
+                .where(and_(*date_filters))
             )
             result = await session.execute(latest_date_stmt)
             latest_date = result.scalar()
@@ -198,14 +207,18 @@ class PredictionStore:
             if latest_date is None:
                 return []
 
+            filters = [
+                StockPrediction.market == market,
+                StockPrediction.prediction_date == latest_date,
+            ]
+            if forward_days is not None:
+                filters.append(StockPrediction.forward_days == forward_days)
+            if symbol is not None:
+                filters.append(StockPrediction.symbol == symbol)
+
             stmt = (
                 select(StockPrediction)
-                .where(
-                    and_(
-                        StockPrediction.market == market,
-                        StockPrediction.prediction_date == latest_date,
-                    )
-                )
+                .where(and_(*filters))
                 .order_by(desc(StockPrediction.rank_score))
                 .limit(top_n)
             )

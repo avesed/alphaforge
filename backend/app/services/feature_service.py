@@ -36,16 +36,17 @@ logger = logging.getLogger(__name__)
 # 86 Alpha158 OHLCV-based features (from factor_service.py)
 ALPHA158_FEATURES: list[str] = list(FEATURE_NAMES)
 
-# ~22 fundamental financial metrics currently active in training
-# (28 in source; 6 FCF features deferred until 3+ years of quarterly backfill)
+# Fundamental financial metrics from StockPulse.
+# Direct from valuation: pe_ratio..payout_ratio.
+# Derived from sec_filings: revenue_growth_yoy, eps_growth, dividend_yield, net_cash_ratio.
+# forward_pe/dividend_rate require analyst estimates — not available.
+# short_pct_float/short_ratio come from the short interest endpoint, not here.
 FUNDAMENTAL_FEATURES: list[str] = [
     "pe_ratio", "pb_ratio", "ps_ratio", "roe", "roa",
-    "profit_margin", "gross_margin", "revenue_growth_yoy", "eps",
-    "debt_to_equity", "current_ratio", "dividend_yield", "market_cap",
-    "forward_pe", "dividend_rate", "book_value",
-    "operating_margin", "payout_ratio", "eps_growth",
-    "net_cash_ratio",
-    "short_pct_float", "short_ratio",
+    "profit_margin", "gross_margin", "eps",
+    "debt_to_equity", "current_ratio", "market_cap", "book_value",
+    "operating_margin", "payout_ratio",
+    "revenue_growth_yoy", "eps_growth", "dividend_yield", "net_cash_ratio",
 ]
 
 # ~11 sentiment rolling features
@@ -75,8 +76,8 @@ ANALYST_FEATURES: list[str] = [
 # Insider activity
 INSIDER_FEATURES: list[str] = ["net_shares_pct", "insider_ownership_pct"]
 
-# Options put/call ratio (US only)
-OPTIONS_FEATURES: list[str] = ["put_call_ratio"]
+# Options put/call ratio (US only) — also serves as sentiment proxy
+OPTIONS_FEATURES: list[str] = ["put_call_ratio", "put_call_oi_ratio"]
 
 # Earnings calendar features
 EARNINGS_CALENDAR_FEATURES: list[str] = ["days_to_earnings"]
@@ -210,13 +211,8 @@ class FeatureService:
             )
             task_names.append("fundamentals")
 
-        if include_sentiment:
-            tasks.append(
-                asyncio.create_task(
-                    self._safe_get_sentiment(symbols, start_date, end_date, market),
-                )
-            )
-            task_names.append("sentiment")
+        # Sentiment: StockPulse endpoint deprecated; skip to avoid empty NaN columns.
+        # Future: source from NewsForge integration.
 
         if EARNINGS_FEATURES:
             tasks.append(asyncio.create_task(
@@ -338,27 +334,42 @@ class FeatureService:
 
         if not analyst_df.empty:
             analyst_df["date"] = pd.to_datetime(analyst_df["date"].astype(str).str[:10], errors="coerce")
-            ana_cols = ["symbol", "date"] + [
+            ana_feature_cols = [
                 c for c in ANALYST_FEATURES if c in analyst_df.columns
             ]
+            ana_cols = ["symbol", "date"] + ana_feature_cols
             merged = merged.merge(analyst_df[ana_cols], on=["symbol", "date"], how="left")
-            logger.info("Merged analyst features: %d columns added", len(ana_cols) - 2)
+            if ana_feature_cols:
+                merged = merged.sort_values(["symbol", "date"])
+                merged[ana_feature_cols] = merged.groupby("symbol")[ana_feature_cols].ffill()
+                merged = merged.reset_index(drop=True)
+            logger.info("Merged analyst features: %d columns added (with forward-fill)", len(ana_cols) - 2)
 
         if not insider_df.empty:
             insider_df["date"] = pd.to_datetime(insider_df["date"].astype(str).str[:10], errors="coerce")
-            ins_cols = ["symbol", "date"] + [
+            ins_feature_cols = [
                 c for c in INSIDER_FEATURES if c in insider_df.columns
             ]
+            ins_cols = ["symbol", "date"] + ins_feature_cols
             merged = merged.merge(insider_df[ins_cols], on=["symbol", "date"], how="left")
-            logger.info("Merged insider features: %d columns added", len(ins_cols) - 2)
+            if ins_feature_cols:
+                merged = merged.sort_values(["symbol", "date"])
+                merged[ins_feature_cols] = merged.groupby("symbol")[ins_feature_cols].ffill()
+                merged = merged.reset_index(drop=True)
+            logger.info("Merged insider features: %d columns added (with forward-fill)", len(ins_cols) - 2)
 
         if not options_df.empty:
             options_df["date"] = pd.to_datetime(options_df["date"].astype(str).str[:10], errors="coerce")
-            opt_cols = ["symbol", "date"] + [
+            opt_feature_cols = [
                 c for c in OPTIONS_FEATURES if c in options_df.columns
             ]
+            opt_cols = ["symbol", "date"] + opt_feature_cols
             merged = merged.merge(options_df[opt_cols], on=["symbol", "date"], how="left")
-            logger.info("Merged options features: %d columns added", len(opt_cols) - 2)
+            if opt_feature_cols:
+                merged = merged.sort_values(["symbol", "date"])
+                merged[opt_feature_cols] = merged.groupby("symbol")[opt_feature_cols].ffill()
+                merged = merged.reset_index(drop=True)
+            logger.info("Merged options features: %d columns added (with forward-fill)", len(opt_cols) - 2)
 
         if not short_interest_df.empty:
             short_interest_df["date"] = pd.to_datetime(short_interest_df["date"].astype(str).str[:10], errors="coerce")
@@ -394,8 +405,16 @@ class FeatureService:
                         merged = merged.drop(columns=[si_col])
             else:
                 merged = merged.merge(si_new, on=["symbol", "date"], how="left")
+            si_feature_cols = [
+                c for c in merged.columns
+                if c in short_interest_df.columns and c not in ("symbol", "date")
+            ]
+            if si_feature_cols:
+                merged = merged.sort_values(["symbol", "date"])
+                merged[si_feature_cols] = merged.groupby("symbol")[si_feature_cols].ffill()
+                merged = merged.reset_index(drop=True)
             logger.info(
-                "Merged short interest features: %d columns",
+                "Merged short interest features: %d columns (with forward-fill)",
                 len(si_cols) - 2,
             )
 
@@ -639,13 +658,29 @@ class FeatureService:
     async def _safe_get_fundamentals(
         symbols: list[str], start_date: str, end_date: str, market: str,
     ) -> pd.DataFrame:
-        """Fetch fundamentals via StockPulse API with error isolation."""
+        """Fetch fundamentals via StockPulse API with error isolation.
+
+        Requests an extra 400 days before start_date so derived YoY
+        features (revenue_growth_yoy, eps_growth) have prior-year
+        comparisons. Batches symbols to avoid overloading StockPulse.
+        """
         try:
+            from datetime import date as _date, timedelta
+            extended_start = (
+                _date.fromisoformat(start_date) - timedelta(days=400)
+            ).isoformat()
             client = await get_stockpulse_async_client()
-            data = await client.get_fundamentals_batch(symbols, market, start_date, end_date)
-            if not data:
+            all_data: list[dict] = []
+            batch_size = 200
+            for i in range(0, len(symbols), batch_size):
+                batch = symbols[i : i + batch_size]
+                rows = await client.get_fundamentals_batch(
+                    batch, market, extended_start, end_date,
+                )
+                all_data.extend(rows)
+            if not all_data:
                 return pd.DataFrame()
-            return pd.DataFrame(data)
+            return pd.DataFrame(all_data)
         except Exception as e:
             logger.warning("Fundamental feature retrieval failed: %s", e)
             return pd.DataFrame()

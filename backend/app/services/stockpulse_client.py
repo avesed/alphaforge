@@ -29,6 +29,7 @@ StockPulse API endpoints consumed:
     migration to local DB storage.
 """
 
+import json
 import logging
 from datetime import datetime
 from typing import Any
@@ -361,30 +362,94 @@ class StockPulseAsyncClient:
                 row["gross_margin"] = entry.get("gross_margin")
                 # Map net_margin -> profit_margin if profit_margin not present
                 row["profit_margin"] = entry.get("profit_margin") or entry.get("net_margin")
-                # Optional fields (may be absent in valuation)
-                row["dividend_yield"] = entry.get("dividend_yield")
-                row["dividend_rate"] = entry.get("dividend_rate")
-                row["forward_pe"] = entry.get("forward_pe")
-                row["revenue_growth_yoy"] = entry.get("revenue_growth_yoy")
-                row["eps_growth"] = entry.get("eps_growth")
-                row["net_cash_ratio"] = entry.get("net_cash_ratio")
-                row["short_pct_float"] = entry.get("short_pct_float")
-                row["short_ratio"] = entry.get("short_ratio")
                 result.append(row)
 
-            # --- sec_filings: merge additional fields not in valuation ---
-            for entry in payload.get("sec_filings", []):
-                if not isinstance(entry, dict):
+            # --- sec_filings: extract structured GAAP data ---
+            # income_statement/balance_sheet/cash_flow may be JSON strings
+            filings = payload.get("sec_filings", [])
+            if not isinstance(filings, list):
+                filings = []
+            parsed_filings: list[dict] = []
+            for entry in filings:
+                if not isinstance(entry, dict) or not entry.get("filed_date"):
                     continue
-                row = {"symbol": symbol}
-                row["date"] = entry.get("date", entry.get("filed_date", ""))
-                row["revenue"] = entry.get("revenue")
-                row["net_income"] = entry.get("net_income")
-                row["eps"] = entry.get("eps")
-                row["total_assets"] = entry.get("total_assets")
-                row["total_debt"] = entry.get("total_debt")
-                row["free_cash_flow"] = entry.get("free_cash_flow")
-                result.append(row)
+                pf: dict[str, Any] = {
+                    "date": entry["filed_date"],
+                    "quarter": entry.get("quarter"),
+                    "year": entry.get("year"),
+                }
+                for section in ("income_statement", "balance_sheet", "cash_flow"):
+                    raw = entry.get(section, [])
+                    items = json.loads(raw) if isinstance(raw, str) else (raw or [])
+                    for item in items:
+                        if not isinstance(item, dict):
+                            continue
+                        concept = item.get("concept", "")
+                        val = item.get("value")
+                        if concept == "us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax":
+                            pf["revenue"] = val
+                        elif concept == "us-gaap_NetIncomeLoss" and section == "income_statement":
+                            pf["net_income"] = val
+                        elif concept == "us-gaap_EarningsPerShareBasic":
+                            pf["filing_eps"] = val
+                        elif concept == "us-gaap_CashAndCashEquivalentsAtCarryingValue":
+                            pf["cash"] = val
+                        elif concept == "us-gaap_Assets":
+                            pf["total_assets"] = val
+                        elif concept == "us-gaap_LongTermDebtNoncurrent":
+                            pf["total_debt"] = val
+                        elif concept == "us-gaap_PaymentsOfDividends":
+                            pf["dividends_paid"] = val
+                parsed_filings.append(pf)
+
+            # Compute derived features from sequential filings
+            parsed_filings.sort(key=lambda x: (x.get("year", 0), x.get("quarter", 0)))
+            filing_by_yq: dict[tuple, dict] = {}
+            for pf in parsed_filings:
+                y, q = pf.get("year"), pf.get("quarter")
+                if y and q:
+                    filing_by_yq[(y, q)] = pf
+
+            for pf in parsed_filings:
+                row = {"symbol": symbol, "date": pf["date"]}
+                y, q = pf.get("year"), pf.get("quarter")
+
+                # revenue_growth_yoy: compare to same quarter last year
+                if y and q and pf.get("revenue"):
+                    prev = filing_by_yq.get((y - 1, q))
+                    if prev and prev.get("revenue") and prev["revenue"] != 0:
+                        row["revenue_growth_yoy"] = (
+                            pf["revenue"] - prev["revenue"]
+                        ) / abs(prev["revenue"])
+
+                # eps_growth: compare to same quarter last year
+                if y and q and pf.get("filing_eps") is not None:
+                    prev = filing_by_yq.get((y - 1, q))
+                    if prev and prev.get("filing_eps") is not None and prev["filing_eps"] != 0:
+                        row["eps_growth"] = (
+                            pf["filing_eps"] - prev["filing_eps"]
+                        ) / abs(prev["filing_eps"])
+
+                # dividend_yield: annualized dividends / market_cap
+                if pf.get("dividends_paid") and valuation_entries:
+                    latest_mcap = next(
+                        (v.get("market_cap") for v in reversed(valuation_entries)
+                         if v.get("market_cap")),
+                        None,
+                    )
+                    if latest_mcap and latest_mcap > 0:
+                        row["dividend_yield"] = (
+                            pf["dividends_paid"] * 4
+                        ) / (latest_mcap * 1_000_000)
+
+                # net_cash_ratio: (cash - debt) / total_assets
+                if pf.get("total_assets") and pf["total_assets"] > 0:
+                    cash = pf.get("cash", 0) or 0
+                    debt = pf.get("total_debt", 0) or 0
+                    row["net_cash_ratio"] = (cash - debt) / pf["total_assets"]
+
+                if len(row) > 2:
+                    result.append(row)
         logger.info(
             "get_fundamentals_batch: %d symbols requested, %d rows produced",
             len(symbols), len(result),
@@ -576,10 +641,12 @@ class StockPulseAsyncClient:
 
         result: list[dict] = []
         for symbol, payload in symbols_data.items():
-            if not isinstance(payload, dict):
-                continue
-            entries = payload.get("data", [])
-            if not isinstance(entries, list):
+            # Response may be a direct list or {"data": [...]}
+            if isinstance(payload, list):
+                entries = payload
+            elif isinstance(payload, dict):
+                entries = payload.get("data", [])
+            else:
                 continue
             for entry in entries:
                 if not isinstance(entry, dict):
@@ -588,6 +655,7 @@ class StockPulseAsyncClient:
                     "symbol": symbol,
                     "date": entry.get("date", ""),
                     "put_call_ratio": entry.get("put_call_ratio"),
+                    "put_call_oi_ratio": entry.get("put_call_oi_ratio"),
                     "put_volume": entry.get("put_volume"),
                     "call_volume": entry.get("call_volume"),
                 })

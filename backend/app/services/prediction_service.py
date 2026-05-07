@@ -445,7 +445,7 @@ class PredictionService:
         symbol: Optional[str] = None,
         forward_days: Optional[int] = None,
     ) -> list[dict]:
-        # 1. Try Redis cache
+        # 1. Try Redis cache (only when no filters applied)
         if symbol is None and forward_days is None:
             cached = await self._read_prediction_cache(market)
             if cached is not None:
@@ -454,7 +454,9 @@ class PredictionService:
 
         # 2. Query via local PredictionStore
         try:
-            return await prediction_store.get_latest_predictions(market, top_n)
+            return await prediction_store.get_latest_predictions(
+                market, top_n, symbol=symbol, forward_days=forward_days,
+            )
         except Exception as e:
             logger.error("Failed to query latest predictions: %s", e)
             return []
@@ -722,10 +724,11 @@ class PredictionService:
     # ------------------------------------------------------------------
 
     async def _resolve_symbols(self, market: str) -> list[str]:
-        """Resolve the prediction universe for a market via StockPulse API.
+        """Resolve the prediction universe for a market.
 
-        Fetches all symbols then filters to top N by market cap to keep
-        memory usage manageable for Qlib D.features() + LightGBM training.
+        Fetches all symbols from StockPulse, then filters to top N by
+        average daily trading volume (from Qlib local data) to select
+        liquid, well-covered stocks with good data quality.
         """
         settings = get_settings()
         max_size = settings.PREDICTION_UNIVERSE_SIZE
@@ -746,31 +749,79 @@ class PredictionService:
         if len(all_symbols) <= max_size:
             return all_symbols
 
-        # Filter to top N by market cap via StockPulse batch/sectors
+        # Filter to top N by average volume via Qlib local data
+        try:
+            vol_map = await asyncio.get_running_loop().run_in_executor(
+                None, self._get_avg_volumes, market, all_symbols, settings,
+            )
+            if vol_map:
+                sorted_syms = sorted(vol_map, key=vol_map.get, reverse=True)
+                symbols = sorted_syms[:max_size]
+                logger.info(
+                    "Filtered universe to top %d by avg_volume for %s "
+                    "(min_vol=%.0f, max_vol=%.0f)",
+                    len(symbols), market,
+                    vol_map.get(symbols[-1], 0),
+                    vol_map.get(symbols[0], 0),
+                )
+                return symbols
+        except Exception as e:
+            logger.warning(
+                "Volume filtering failed for %s: %s. "
+                "Falling back to market_cap.", market, e,
+            )
+
+        # Fallback: market cap via StockPulse
         try:
             client = await get_stockpulse_async_client()
             cap_map = await client.get_market_caps(market, all_symbols[:3000])
-
             if cap_map:
                 sorted_syms = sorted(cap_map, key=cap_map.get, reverse=True)
                 symbols = sorted_syms[:max_size]
                 logger.info(
-                    "Filtered universe to top %d by market_cap for %s "
-                    "(min_cap=%.0f, max_cap=%.0f)",
+                    "Filtered universe to top %d by market_cap for %s (fallback)",
                     len(symbols), market,
-                    cap_map.get(symbols[-1], 0),
-                    cap_map.get(symbols[0], 0),
                 )
                 return symbols
-            else:
-                logger.warning("No market_cap data, using first %d symbols", max_size)
         except Exception as e:
-            logger.warning(
-                "Market cap filtering failed for %s, using first %d: %s",
-                market, max_size, e,
-            )
+            logger.warning("Market cap fallback also failed: %s", e)
 
+        logger.warning("No filtering available, using first %d symbols", max_size)
         return all_symbols[:max_size]
+
+    @staticmethod
+    def _get_avg_volumes(
+        market: str, symbols: list[str], settings,
+    ) -> dict[str, float]:
+        """Compute 60-day average volume from Qlib local data (synchronous)."""
+        from app.context import QlibContext
+        from app.utils.symbol_mapping import normalize_symbol_for_qlib, qlib_to_stockpulse
+
+        QlibContext.ensure_init(market, settings.QLIB_DATA_DIR)
+        from qlib.data import D
+        from datetime import date, timedelta
+
+        end = date.today().isoformat()
+        start = (date.today() - timedelta(days=90)).isoformat()
+
+        qlib_syms = [normalize_symbol_for_qlib(s, market) for s in symbols]
+        q_to_ws = dict(zip(qlib_syms, symbols))
+
+        try:
+            df = D.features(qlib_syms, ["$volume"], start_time=start, end_time=end)
+            if df.empty:
+                return {}
+            avg_vol = df.groupby(level=0).mean()
+            result = {}
+            for q_sym in avg_vol.index:
+                ws_sym = q_to_ws.get(q_sym, q_sym)
+                vol = avg_vol.loc[q_sym, "$volume"]
+                if vol > 0:
+                    result[ws_sym] = float(vol)
+            return result
+        except Exception as e:
+            logger.warning("Qlib volume query failed: %s", e)
+            return {}
 
     # ------------------------------------------------------------------
     # Step 2: Check existing model (disk only)
@@ -1856,7 +1907,11 @@ class PredictionService:
 
     async def _refresh_prediction_cache(self, market: str) -> None:
         try:
-            predictions = await prediction_store.get_latest_predictions(market, 500)
+            settings = get_settings()
+            default_horizon = int(settings.PREDICTION_HORIZONS.split(",")[0].strip())
+            predictions = await prediction_store.get_latest_predictions(
+                market, 500, forward_days=default_horizon,
+            )
             if not predictions:
                 return
             key = _prediction_cache_key(market)
