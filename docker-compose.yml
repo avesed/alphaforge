@@ -1,0 +1,70 @@
+services:
+  postgres:
+    image: postgres:16
+    ports:
+      - "5434:5432"
+    environment:
+      POSTGRES_USER: alphaforge
+      POSTGRES_PASSWORD: alphaforge
+      POSTGRES_DB: alphaforge
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alphaforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6381:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy noeviction
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build: .
+    ports:
+      - "8015:80"
+    environment:
+      DATABASE_URL: postgresql+asyncpg://alphaforge:alphaforge@postgres:5432/alphaforge
+      REDIS_URL: redis://redis:6379/0
+      STOCKPULSE_URL: ${STOCKPULSE_URL:-http://host.docker.internal:8010}
+      STOCKPULSE_API_KEY: ${STOCKPULSE_API_KEY:-}
+      AI_GATEWAY_URL: ${AI_GATEWAY_URL:-http://host.docker.internal:8004}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://localhost:8015"
+    env_file:
+      - .env
+    volumes:
+      - qlib_data:/app/data/qlib
+      - predictions:/app/data/predictions
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 12G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8015/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  pgdata:
+  redisdata:
+  qlib_data:
+  predictions:
