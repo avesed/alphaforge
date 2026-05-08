@@ -726,13 +726,23 @@ class PredictionService:
     async def _resolve_symbols(self, market: str) -> list[str]:
         """Resolve the prediction universe for a market.
 
-        Fetches all symbols from StockPulse, then filters to top N by
-        average daily trading volume (from Qlib local data) to select
-        liquid, well-covered stocks with good data quality.
+        Priority:
+        1. Stored universe from system_settings (stable, admin-configured)
+        2. Compute top-N by dollar volume from Qlib, auto-save to settings
+        3. Market cap fallback via StockPulse
         """
         settings = get_settings()
         max_size = settings.PREDICTION_UNIVERSE_SIZE
 
+        # 1. Check stored universe in system_settings
+        stored = await self._get_stored_universe(market)
+        if stored:
+            logger.info(
+                "Using stored universe for %s: %d symbols", market, len(stored),
+            )
+            return stored
+
+        # 2. Compute from Qlib dollar volume and auto-save
         try:
             client = await get_stockpulse_async_client()
             all_symbols = await client.get_universe_symbols(market)
@@ -749,29 +759,26 @@ class PredictionService:
         if len(all_symbols) <= max_size:
             return all_symbols
 
-        # Filter to top N by average volume via Qlib local data
         try:
             vol_map = await asyncio.get_running_loop().run_in_executor(
-                None, self._get_avg_volumes, market, all_symbols, settings,
+                None, self._get_dollar_volumes, market, all_symbols, settings,
             )
             if vol_map:
                 sorted_syms = sorted(vol_map, key=vol_map.get, reverse=True)
                 symbols = sorted_syms[:max_size]
                 logger.info(
-                    "Filtered universe to top %d by avg_volume for %s "
-                    "(min_vol=%.0f, max_vol=%.0f)",
+                    "Computed universe: top %d by dollar_volume for %s "
+                    "(min=%.0f, max=%.0f). Saving to system_settings.",
                     len(symbols), market,
                     vol_map.get(symbols[-1], 0),
                     vol_map.get(symbols[0], 0),
                 )
+                await self._save_stored_universe(market, symbols)
                 return symbols
         except Exception as e:
-            logger.warning(
-                "Volume filtering failed for %s: %s. "
-                "Falling back to market_cap.", market, e,
-            )
+            logger.warning("Volume computation failed for %s: %s", market, e)
 
-        # Fallback: market cap via StockPulse
+        # 3. Fallback: market cap
         try:
             client = await get_stockpulse_async_client()
             cap_map = await client.get_market_caps(market, all_symbols[:3000])
@@ -790,12 +797,62 @@ class PredictionService:
         return all_symbols[:max_size]
 
     @staticmethod
-    def _get_avg_volumes(
+    async def _get_stored_universe(market: str) -> list[str] | None:
+        """Read stored universe from system_settings."""
+        from app.core.orm import get_session_factory
+        from app.models.system_setting import SystemSetting
+        from sqlalchemy import select
+        import json as _json
+
+        key = f"universe:{market}"
+        factory = get_session_factory()
+        async with factory() as session:
+            result = await session.execute(
+                select(SystemSetting.value).where(SystemSetting.key == key)
+            )
+            raw = result.scalar()
+
+        if not raw:
+            return None
+        try:
+            symbols = _json.loads(raw)
+            if isinstance(symbols, list) and len(symbols) >= 10:
+                return symbols
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    async def _save_stored_universe(market: str, symbols: list[str]) -> None:
+        """Save universe to system_settings for future stability."""
+        from app.core.orm import get_session_factory
+        from app.models.system_setting import SystemSetting
+        from sqlalchemy.dialects.postgresql import insert as pg_insert
+        import json as _json
+
+        key = f"universe:{market}"
+        factory = get_session_factory()
+        async with factory() as session:
+            stmt = pg_insert(SystemSetting).values(
+                key=key, value=_json.dumps(symbols),
+            ).on_conflict_do_update(
+                index_elements=["key"],
+                set_={"value": _json.dumps(symbols)},
+            )
+            await session.execute(stmt)
+            await session.commit()
+
+    @staticmethod
+    def _get_dollar_volumes(
         market: str, symbols: list[str], settings,
     ) -> dict[str, float]:
-        """Compute 60-day average volume from Qlib local data (synchronous)."""
+        """Compute 60-day average dollar volume from Qlib (synchronous).
+
+        Dollar volume (price × volume) is a better liquidity proxy than
+        raw share volume, since it normalizes across different price levels.
+        """
         from app.context import QlibContext
-        from app.utils.symbol_mapping import normalize_symbol_for_qlib, qlib_to_stockpulse
+        from app.utils.symbol_mapping import normalize_symbol_for_qlib
 
         QlibContext.ensure_init(market, settings.QLIB_DATA_DIR)
         from qlib.data import D
@@ -807,21 +864,25 @@ class PredictionService:
         qlib_syms = [normalize_symbol_for_qlib(s, market) for s in symbols]
         q_to_ws = dict(zip(qlib_syms, symbols))
 
-        try:
-            df = D.features(qlib_syms, ["$volume"], start_time=start, end_time=end)
-            if df.empty:
-                return {}
-            avg_vol = df.groupby(level=0).mean()
-            result = {}
-            for q_sym in avg_vol.index:
-                ws_sym = q_to_ws.get(q_sym, q_sym)
-                vol = avg_vol.loc[q_sym, "$volume"]
-                if vol > 0:
-                    result[ws_sym] = float(vol)
-            return result
-        except Exception as e:
-            logger.warning("Qlib volume query failed: %s", e)
-            return {}
+        result: dict[str, float] = {}
+        chunk_size = 500
+        for i in range(0, len(qlib_syms), chunk_size):
+            chunk = qlib_syms[i : i + chunk_size]
+            try:
+                df = D.features(chunk, ["$volume", "$close"], start_time=start, end_time=end)
+                if df.empty:
+                    continue
+                avg = df.groupby(level=0).mean()
+                for q_sym in avg.index:
+                    ws_sym = q_to_ws.get(q_sym, q_sym)
+                    vol = avg.loc[q_sym, "$volume"]
+                    close = avg.loc[q_sym, "$close"]
+                    if vol > 0 and close > 0:
+                        result[ws_sym] = float(vol * close)
+            except Exception as e:
+                logger.warning("Qlib volume chunk %d failed: %s", i, e)
+
+        return result
 
     # ------------------------------------------------------------------
     # Step 2: Check existing model (disk only)
