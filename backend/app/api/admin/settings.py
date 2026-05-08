@@ -15,6 +15,7 @@ from app.core.orm import get_db
 from app.models.system_setting import SystemSetting
 from app.models.user import User
 from app.schemas.settings import SettingResponse, SettingUpdate
+from app.services.newsforge_client import close_newsforge_client
 from app.services.stockpulse_client import close_stockpulse_async_client
 
 logger = logging.getLogger(__name__)
@@ -64,11 +65,16 @@ async def bulk_update_settings(
 
     logger.info("Admin %s bulk-updated %d settings", admin.email, len(body))
 
-    # Reset StockPulse async client if connection settings changed
+    # Reset async clients if connection settings changed
     _stockpulse_keys = {"stockpulse_url", "stockpulse_api_key"}
     if _stockpulse_keys & body.keys():
         await close_stockpulse_async_client()
         logger.info("StockPulse async client reset due to settings change")
+
+    _newsforge_keys = {"newsforge_url", "newsforge_api_key"}
+    if _newsforge_keys & body.keys():
+        await close_newsforge_client()
+        logger.info("NewsForge client reset due to settings change")
 
     # Return the full settings dict after update
     result = await db.execute(
@@ -103,6 +109,42 @@ async def test_stockpulse_connection(
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
                 f"{url.rstrip('/')}/health",
+                headers={"X-API-Key": api_key},
+            )
+            if resp.status_code == 200:
+                return {"connected": True, "error": None}
+            return {
+                "connected": False,
+                "error": f"HTTP {resp.status_code}: {resp.text[:200]}",
+            }
+    except Exception as e:
+        return {"connected": False, "error": f"{type(e).__name__}: {e}"}
+
+
+@router.get("/newsforge/test")
+async def test_newsforge_connection(
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Test connectivity to the NewsForge API."""
+    settings = get_settings()
+
+    url_result = await db.execute(
+        select(SystemSetting).where(SystemSetting.key == "newsforge_url")
+    )
+    url_setting = url_result.scalar_one_or_none()
+    url = url_setting.value if url_setting else settings.NEWSFORGE_URL
+
+    key_result = await db.execute(
+        select(SystemSetting).where(SystemSetting.key == "newsforge_api_key")
+    )
+    key_setting = key_result.scalar_one_or_none()
+    api_key = key_setting.value if key_setting else settings.NEWSFORGE_API_KEY
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.get(
+                f"{url.rstrip('/')}/api/v1/health",
                 headers={"X-API-Key": api_key},
             )
             if resp.status_code == 200:

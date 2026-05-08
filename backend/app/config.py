@@ -44,6 +44,10 @@ class Settings(BaseSettings):
     STOCKPULSE_URL: str = "http://stockpulse:8010"
     STOCKPULSE_API_KEY: str = ""
 
+    # NewsForge API (sentiment data)
+    NEWSFORGE_URL: str = "http://newsforge:8080"
+    NEWSFORGE_API_KEY: str = ""
+
     # AI Gateway (LLM proxy for RD-Agent)
     AI_GATEWAY_URL: str = "http://ai-gateway:8004"
 

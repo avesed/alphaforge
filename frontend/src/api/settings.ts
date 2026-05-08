@@ -24,4 +24,7 @@ export const settingsApi = {
 
   testStockPulse: () =>
     apiClient.get<{ connected: boolean; error?: string }>('/admin/settings/stockpulse/test'),
+
+  testNewsForge: () =>
+    apiClient.get<{ connected: boolean; error?: string }>('/admin/settings/newsforge/test'),
 }

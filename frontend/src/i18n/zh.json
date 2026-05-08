@@ -248,7 +248,14 @@
     "stockpulseApiKeyHint": "密钥尾号 ...{{suffix}}",
     "testConnection": "测试连接",
     "stockpulseConnected": "StockPulse 连接成功",
-    "stockpulseDisconnected": "StockPulse 连接失败"
+    "stockpulseDisconnected": "StockPulse 连接失败",
+    "newsforgeConnection": "NewsForge 连接",
+    "newsforgeConnectionDesc": "配置 NewsForge 情绪数据 API 连接",
+    "newsforgeUrl": "NewsForge 地址",
+    "newsforgeApiKey": "API 密钥",
+    "newsforgeApiKeyHint": "密钥尾号 ...{{suffix}}",
+    "newsforgeConnected": "NewsForge 连接成功",
+    "newsforgeDisconnected": "NewsForge 连接失败"
   },
   "mlTools": {
     "title": "ML 工具",

@@ -248,7 +248,14 @@
     "stockpulseApiKeyHint": "Key ending in ...{{suffix}}",
     "testConnection": "Test Connection",
     "stockpulseConnected": "StockPulse connection successful",
-    "stockpulseDisconnected": "StockPulse connection failed"
+    "stockpulseDisconnected": "StockPulse connection failed",
+    "newsforgeConnection": "NewsForge Connection",
+    "newsforgeConnectionDesc": "Configure the connection to NewsForge sentiment API",
+    "newsforgeUrl": "NewsForge URL",
+    "newsforgeApiKey": "API Key",
+    "newsforgeApiKeyHint": "Key ending in ...{{suffix}}",
+    "newsforgeConnected": "NewsForge connection successful",
+    "newsforgeDisconnected": "NewsForge connection failed"
   },
   "mlTools": {
     "title": "ML Tools",

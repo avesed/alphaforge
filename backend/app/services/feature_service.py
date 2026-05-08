@@ -211,8 +211,10 @@ class FeatureService:
             )
             task_names.append("fundamentals")
 
-        # Sentiment: StockPulse endpoint deprecated; skip to avoid empty NaN columns.
-        # Future: source from NewsForge integration.
+        tasks.append(asyncio.create_task(
+            self._safe_get_sentiment(symbols, start_date, end_date, market),
+        ))
+        task_names.append("sentiment")
 
         if EARNINGS_FEATURES:
             tasks.append(asyncio.create_task(
@@ -689,13 +691,59 @@ class FeatureService:
     async def _safe_get_sentiment(
         symbols: list[str], start_date: str, end_date: str, market: str,
     ) -> pd.DataFrame:
-        """Fetch sentiment features via StockPulse API with error isolation."""
+        """Fetch daily sentiment from NewsForge and compute rolling features.
+
+        NewsForge returns per-symbol per-day: sentiment_avg, article_count,
+        bullish_ratio, content_score_avg.  We compute 7d/30d rolling
+        aggregates locally.
+        """
+        from app.services.newsforge_client import get_newsforge_client
+
         try:
-            client = await get_stockpulse_async_client()
-            data = await client.get_sentiment_batch(symbols, market, start_date, end_date)
+            client = await get_newsforge_client()
+            data = await client.get_sentiment_batch(
+                symbols, market, start_date, end_date,
+            )
             if not data:
                 return pd.DataFrame()
-            return pd.DataFrame(data)
+
+            df = pd.DataFrame(data)
+            df["date"] = pd.to_datetime(df["date"])
+            df = df.sort_values(["symbol", "date"])
+
+            for col in ["sentiment_avg", "article_count", "bullish_ratio", "content_score_avg"]:
+                if col not in df.columns:
+                    df[col] = None
+
+            grouped = df.groupby("symbol", sort=False)
+
+            df["sentiment_7d_ma"] = grouped["sentiment_avg"].transform(
+                lambda s: s.rolling(7, min_periods=1).mean()
+            )
+            df["sentiment_30d_ma"] = grouped["sentiment_avg"].transform(
+                lambda s: s.rolling(30, min_periods=1).mean()
+            )
+            df["sentiment_volatility_7d"] = grouped["sentiment_avg"].transform(
+                lambda s: s.rolling(7, min_periods=2).std()
+            )
+            df["article_count_7d"] = grouped["article_count"].transform(
+                lambda s: s.rolling(7, min_periods=1).sum()
+            )
+            df["bullish_ratio_7d"] = grouped["bullish_ratio"].transform(
+                lambda s: s.rolling(7, min_periods=1).mean()
+            )
+            df["has_news_7d"] = grouped["article_count"].transform(
+                lambda s: (s.rolling(7, min_periods=1).sum() > 0).astype(float)
+            )
+            df["has_news_30d"] = grouped["article_count"].transform(
+                lambda s: (s.rolling(30, min_periods=1).sum() > 0).astype(float)
+            )
+
+            logger.info(
+                "Sentiment features: %d rows, %d symbols, rolling windows computed",
+                len(df), df["symbol"].nunique(),
+            )
+            return df
         except Exception as e:
             logger.warning("Sentiment feature retrieval failed: %s", e)
             return pd.DataFrame()

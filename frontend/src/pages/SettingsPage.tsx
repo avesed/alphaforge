@@ -12,6 +12,7 @@ import {
   AlertTriangle,
   Lock,
   Link2,
+  Newspaper,
 } from 'lucide-react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -749,6 +750,166 @@ function StockPulseSettingsSection() {
   )
 }
 
+// ── NewsForge Connection section ──────────────
+
+function NewsForgeSettingsSection() {
+  const { t } = useTranslation()
+  const { toast } = useToast()
+  const queryClient = useQueryClient()
+  const [url, setUrl] = useState('')
+  const [apiKey, setApiKey] = useState('')
+  const [hasChanges, setHasChanges] = useState(false)
+
+  const settingsQuery = useQuery({
+    queryKey: ['settings'],
+    queryFn: () => settingsApi.getAll().then((r) => r.data),
+  })
+
+  useEffect(() => {
+    if (settingsQuery.data != null) {
+      setUrl(settingsQuery.data['newsforge_url'] ?? '')
+      setApiKey(settingsQuery.data['newsforge_api_key'] ?? '')
+      setHasChanges(false)
+    }
+  }, [settingsQuery.data])
+
+  const existingKey = settingsQuery.data?.['newsforge_api_key'] ?? ''
+  const keyHint =
+    existingKey.length >= 4 ? existingKey.slice(-4) : ''
+
+  const testMutation = useMutation({
+    mutationFn: () => settingsApi.testNewsForge().then((r) => r.data),
+    onSuccess: (data) => {
+      if (data.connected) {
+        toast({ title: t('settings.newsforgeConnected') })
+      } else {
+        toast({
+          title: t('settings.newsforgeDisconnected'),
+          description: data.error,
+          variant: 'destructive',
+        })
+      }
+    },
+    onError: (err) => {
+      toast({
+        title: t('settings.newsforgeDisconnected'),
+        description: getErrorMessage(err),
+        variant: 'destructive',
+      })
+    },
+  })
+
+  const saveMutation = useMutation({
+    mutationFn: () =>
+      settingsApi.update({
+        newsforge_url: url,
+        newsforge_api_key: apiKey,
+      }),
+    onSuccess: () => {
+      toast({ title: t('settings.saved') })
+      setHasChanges(false)
+      void queryClient.invalidateQueries({ queryKey: ['settings'] })
+    },
+    onError: (err) => {
+      toast({
+        title: 'Save failed',
+        description: getErrorMessage(err),
+        variant: 'destructive',
+      })
+    },
+  })
+
+  if (settingsQuery.isLoading) {
+    return (
+      <Card>
+        <CardHeader>
+          <Skeleton className="h-5 w-40" />
+          <Skeleton className="h-4 w-56" />
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <Skeleton className="h-8 w-full" />
+          <Skeleton className="h-8 w-full" />
+        </CardContent>
+      </Card>
+    )
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="flex items-center gap-2 text-base">
+          <Newspaper className="h-4 w-4" />
+          {t('settings.newsforgeConnection')}
+        </CardTitle>
+        <CardDescription>
+          {t('settings.newsforgeConnectionDesc')}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="space-y-2">
+          <Label className="text-sm font-medium">
+            {t('settings.newsforgeUrl')}
+          </Label>
+          <Input
+            type="text"
+            value={url}
+            onChange={(e) => {
+              setUrl(e.target.value)
+              setHasChanges(true)
+            }}
+            placeholder="https://..."
+          />
+        </div>
+        <div className="space-y-2">
+          <Label className="text-sm font-medium">
+            {t('settings.newsforgeApiKey')}
+          </Label>
+          <Input
+            type="password"
+            value={apiKey}
+            onChange={(e) => {
+              setApiKey(e.target.value)
+              setHasChanges(true)
+            }}
+          />
+          {keyHint && (
+            <p className="text-xs text-muted-foreground">
+              {t('settings.newsforgeApiKeyHint', { suffix: keyHint })}
+            </p>
+          )}
+        </div>
+        <div className="flex items-center justify-between border-t pt-4">
+          <Button
+            variant="outline"
+            size="sm"
+            disabled={testMutation.isPending}
+            onClick={() => testMutation.mutate()}
+          >
+            {testMutation.isPending ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <RefreshCw className="mr-2 h-4 w-4" />
+            )}
+            {t('settings.testConnection')}
+          </Button>
+          <Button
+            size="sm"
+            disabled={!hasChanges || saveMutation.isPending}
+            onClick={() => saveMutation.mutate()}
+          >
+            {saveMutation.isPending ? (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            ) : (
+              <Save className="mr-2 h-4 w-4" />
+            )}
+            {t('common.save')}
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
+  )
+}
+
 // ── Main Page ──────────────────────────────
 
 export default function SettingsPage() {
@@ -768,6 +929,7 @@ export default function SettingsPage() {
 
       <MLSettingsSection />
       <StockPulseSettingsSection />
+      <NewsForgeSettingsSection />
       <PasswordChangeSection />
       <SchedulerSection />
     </div>
