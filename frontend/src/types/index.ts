@@ -19,14 +19,17 @@ export interface ApiError {
 export type Market = 'us' | 'cn' | 'hk'
 
 export interface PredictionModel {
-  id: number
+  id: string
   market: Market
   modelDate: string
+  modelType: string
   forwardDays: number
-  ic: number
-  icir: number
-  ndcg: number
+  ic: number | null
+  icir: number | null
+  ndcg: number | null
   qualityPassed: boolean
+  featureCount: number | null
+  symbolCount: number | null
   createdAt: string
 }
 

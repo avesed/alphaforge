@@ -147,7 +147,7 @@ export default function DashboardPage() {
     },
   })
 
-  // Find latest model per market
+  // Find latest ranking model per market (ranking models have IC/ICIR/NDCG)
   const latestModels: Record<Market, PredictionModel | undefined> = {
     cn: undefined,
     us: undefined,
@@ -156,7 +156,11 @@ export default function DashboardPage() {
   if (modelsQuery.data) {
     for (const model of modelsQuery.data) {
       const existing = latestModels[model.market]
-      if (existing == null || model.modelDate > existing.modelDate) {
+      if (existing == null) {
+        latestModels[model.market] = model
+      } else if (model.modelDate > existing.modelDate) {
+        latestModels[model.market] = model
+      } else if (model.modelDate === existing.modelDate && model.modelType === 'ranking' && existing.modelType !== 'ranking') {
         latestModels[model.market] = model
       }
     }

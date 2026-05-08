@@ -7,7 +7,7 @@ import {
 } from 'lucide-react'
 
 import { predictionsApi } from '@/api/predictions'
-import type { Market } from '@/types'
+import type { Market, PerformanceMetric } from '@/types'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn, formatDate } from '@/lib/utils'
@@ -134,11 +134,11 @@ function MetricsTab({ market, days }: { market: Market; days: number }) {
     )
   }
 
-  const metrics = performance ?? []
+  const metrics: PerformanceMetric[] = performance ?? []
   const avgIc = metrics.length > 0
     ? metrics.reduce((sum, m) => sum + m.ic, 0) / metrics.length
     : 0
-  const avgHitRate = accuracy?.overall.hitRate ?? 0
+  const avgHitRate = accuracy?.directionAccuracy ?? 0
   const avgSpread = metrics.length > 0
     ? metrics.reduce((sum, m) => sum + m.spread, 0) / metrics.length
     : 0

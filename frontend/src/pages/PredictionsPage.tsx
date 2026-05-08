@@ -9,8 +9,6 @@ import {
   ArrowUpRight,
   ArrowDownRight,
   Minus,
-  CheckCircle2,
-  XCircle,
   BarChart3,
   TrendingUp,
   Activity,
@@ -393,13 +391,8 @@ function ResultsTab() {
                   {MARKET_LABELS[market]} Predictions
                 </CardTitle>
                 <CardDescription>
-                  {latestQuery.data.predictionDate} | Model:{' '}
-                  {latestQuery.data.modelDate}
-                  {latestQuery.data.qualityPassed ? (
-                    <CheckCircle2 className="ml-1 inline h-3.5 w-3.5 text-green-600" />
-                  ) : (
-                    <XCircle className="ml-1 inline h-3.5 w-3.5 text-red-600" />
-                  )}
+                  {latestQuery.data.predictionDate ?? 'No date'}
+                  {' | '}{latestQuery.data.count} predictions
                 </CardDescription>
               </div>
               <span className="text-sm text-muted-foreground">
@@ -533,127 +526,79 @@ function AccuracyTab() {
       )}
 
       {data != null && (
-        <>
-          <div className="grid gap-4 md:grid-cols-3">
-            <Card>
-              <CardContent className="p-6">
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Target className="h-4 w-4" />
-                  Direction Accuracy
-                </div>
-                <div
-                  className={cn(
-                    'mt-2 text-3xl font-bold',
-                    data.overall.hitRate >= 0.55
-                      ? 'text-green-600 dark:text-green-400'
-                      : data.overall.hitRate < 0.5
-                        ? 'text-red-600 dark:text-red-400'
+        <div className="grid gap-4 md:grid-cols-3">
+          <Card>
+            <CardContent className="p-6">
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <Target className="h-4 w-4" />
+                Direction Accuracy
+              </div>
+              <div
+                className={cn(
+                  'mt-2 text-3xl font-bold',
+                  data.directionAccuracy != null && data.directionAccuracy >= 0.55
+                    ? 'text-green-600 dark:text-green-400'
+                    : data.directionAccuracy != null && data.directionAccuracy < 0.5
+                      ? 'text-red-600 dark:text-red-400'
+                      : ''
+                )}
+              >
+                {data.directionAccuracy != null
+                  ? `${(data.directionAccuracy * 100).toFixed(1)}%`
+                  : '--'}
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {data.totalPredictions} predictions
+              </p>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardContent className="p-6">
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <TrendingUp className="h-4 w-4" />
+                Average IC
+              </div>
+              <div
+                className={cn(
+                  'mt-2 text-3xl font-bold font-mono',
+                  data.ic != null && data.ic > 0.02
+                    ? 'text-green-600 dark:text-green-400'
+                    : data.ic != null && data.ic < 0.01
+                      ? 'text-red-600 dark:text-red-400'
+                      : data.ic != null
+                        ? 'text-yellow-600 dark:text-yellow-400'
                         : ''
-                  )}
-                >
-                  {(data.overall.hitRate * 100).toFixed(1)}%
-                </div>
-              </CardContent>
-            </Card>
+                )}
+              >
+                {data.ic != null ? data.ic.toFixed(4) : '--'}
+              </div>
+            </CardContent>
+          </Card>
 
-            <Card>
-              <CardContent className="p-6">
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <TrendingUp className="h-4 w-4" />
-                  Average IC
-                </div>
-                <div
-                  className={cn(
-                    'mt-2 text-3xl font-bold font-mono',
-                    data.overall.avgIc > 0.02
-                      ? 'text-green-600 dark:text-green-400'
-                      : data.overall.avgIc < 0.01
-                        ? 'text-red-600 dark:text-red-400'
-                        : 'text-yellow-600 dark:text-yellow-400'
-                  )}
-                >
-                  {data.overall.avgIc.toFixed(4)}
-                </div>
-              </CardContent>
-            </Card>
-
-            <Card>
-              <CardContent className="p-6">
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <BarChart3 className="h-4 w-4" />
-                  Average ICIR
-                </div>
-                <div
-                  className={cn(
-                    'mt-2 text-3xl font-bold font-mono',
-                    data.overall.avgIcir > 0.3
-                      ? 'text-green-600 dark:text-green-400'
-                      : data.overall.avgIcir < 0.1
-                        ? 'text-red-600 dark:text-red-400'
-                        : 'text-yellow-600 dark:text-yellow-400'
-                  )}
-                >
-                  {data.overall.avgIcir.toFixed(4)}
-                </div>
-              </CardContent>
-            </Card>
-          </div>
-
-          {/* Daily breakdown */}
-          {data.daily.length > 0 && (
-            <Card>
-              <CardHeader className="pb-3">
-                <CardTitle className="text-base">Daily Breakdown</CardTitle>
-                <CardDescription>
-                  {data.daily.length} trading days
-                </CardDescription>
-              </CardHeader>
-              <CardContent>
-                <div className="overflow-x-auto">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="border-b text-left text-muted-foreground">
-                        <th className="pb-2 pr-4 font-medium">Date</th>
-                        <th className="pb-2 pr-4 font-medium text-right">
-                          Hit Rate
-                        </th>
-                        <th className="pb-2 pr-4 font-medium text-right">IC</th>
-                        <th className="pb-2 font-medium text-right">Symbols</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {data.daily.slice(0, 20).map((d) => (
-                        <tr
-                          key={d.date}
-                          className="border-b border-border/50 last:border-0"
-                        >
-                          <td className="py-2 pr-4 font-mono">{d.date}</td>
-                          <td className="py-2 pr-4 text-right">
-                            <span
-                              className={cn(
-                                'font-medium',
-                                d.hitRate >= 0.55 &&
-                                  'text-green-600 dark:text-green-400',
-                                d.hitRate < 0.5 &&
-                                  'text-red-600 dark:text-red-400'
-                              )}
-                            >
-                              {(d.hitRate * 100).toFixed(1)}%
-                            </span>
-                          </td>
-                          <td className="py-2 pr-4 text-right font-mono">
-                            {d.ic.toFixed(4)}
-                          </td>
-                          <td className="py-2 text-right">{d.symbolCount}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              </CardContent>
-            </Card>
-          )}
-        </>
+          <Card>
+            <CardContent className="p-6">
+              <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                <BarChart3 className="h-4 w-4" />
+                Average ICIR
+              </div>
+              <div
+                className={cn(
+                  'mt-2 text-3xl font-bold font-mono',
+                  data.icir != null && data.icir > 0.3
+                    ? 'text-green-600 dark:text-green-400'
+                    : data.icir != null && data.icir < 0.1
+                      ? 'text-red-600 dark:text-red-400'
+                      : data.icir != null
+                        ? 'text-yellow-600 dark:text-yellow-400'
+                        : ''
+                )}
+              >
+                {data.icir != null ? data.icir.toFixed(4) : '--'}
+              </div>
+            </CardContent>
+          </Card>
+        </div>
       )}
     </div>
   )

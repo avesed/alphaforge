@@ -92,12 +92,12 @@ function MarketBadge({ market }: { market: Market }) {
   )
 }
 
-function FeatureImportancePanel({ modelId }: { modelId: number }) {
+function FeatureImportancePanel({ modelId }: { modelId: string }) {
   const featureQuery = useQuery({
     queryKey: ['featureImportance', modelId],
     queryFn: () =>
       predictionsApi
-        .getFeatureImportance(String(modelId))
+        .getFeatureImportance(modelId)
         .then((r) => r.data),
   })
 
@@ -176,7 +176,7 @@ export default function ModelsPage() {
   const { toast } = useToast()
   const queryClient = useQueryClient()
   const [marketFilter, setMarketFilter] = useState<Market | 'all'>('all')
-  const [expandedId, setExpandedId] = useState<number | null>(null)
+  const [expandedId, setExpandedId] = useState<string | null>(null)
 
   const modelsQuery = useQuery({
     queryKey: ['models', marketFilter === 'all' ? undefined : marketFilter],
@@ -191,9 +191,9 @@ export default function ModelsPage() {
       modelId,
       passed,
     }: {
-      modelId: number
+      modelId: string
       passed: boolean
-    }) => predictionsApi.updateModelQuality(String(modelId), passed),
+    }) => predictionsApi.updateModelQuality(modelId, passed),
     onSuccess: () => {
       toast({ title: 'Quality updated' })
       void queryClient.invalidateQueries({ queryKey: ['models'] })
@@ -317,22 +317,22 @@ export default function ModelsPage() {
                           <td
                             className={cn(
                               'p-4 text-right font-mono font-medium',
-                              model.ic > 0.02 &&
+                              model.ic != null && model.ic > 0.02 &&
                                 'text-green-600 dark:text-green-400',
-                              model.ic >= 0.01 &&
+                              model.ic != null && model.ic >= 0.01 &&
                                 model.ic <= 0.02 &&
                                 'text-yellow-600 dark:text-yellow-400',
-                              model.ic < 0.01 &&
+                              model.ic != null && model.ic < 0.01 &&
                                 'text-red-600 dark:text-red-400'
                             )}
                           >
-                            {model.ic.toFixed(4)}
+                            {model.ic != null ? model.ic.toFixed(4) : '--'}
                           </td>
                           <td className="p-4 text-right font-mono">
-                            {model.icir.toFixed(4)}
+                            {model.icir != null ? model.icir.toFixed(4) : '--'}
                           </td>
                           <td className="p-4 text-right font-mono">
-                            {model.ndcg.toFixed(4)}
+                            {model.ndcg != null ? model.ndcg.toFixed(4) : '--'}
                           </td>
                           <td className="p-4">
                             <QualityBadge passed={model.qualityPassed} />

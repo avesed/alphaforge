@@ -157,14 +157,34 @@ async def require_admin(user: User = Depends(get_current_user)) -> User:
 
 async def get_api_consumer(
     request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Depends(security),
     db: AsyncSession = Depends(get_db),
 ) -> ApiConsumer:
-    """Validate X-API-Key header, hash with SHA-256, lookup in DB.
+    """Validate X-API-Key header or JWT Bearer token.
 
-    Updates last_used_at on success (throttled to once per 5 minutes).
+    X-API-Key: SHA-256 hash lookup in DB, updates last_used_at (throttled 5min).
+    JWT Bearer: admin users get a transient ApiConsumer (no DB write).
     """
     raw_key = request.headers.get("X-API-Key")
     if not raw_key:
+        if credentials is not None:
+            try:
+                payload = jwt.decode(credentials.credentials, get_jwt_secret(), algorithms=[ALGORITHM])
+                user_id = int(payload.get("sub", 0))
+                if user_id and payload.get("type") == "access":
+                    result = await db.execute(
+                        select(User).where(User.id == user_id, User.is_active.is_(True))
+                    )
+                    user = result.scalar_one_or_none()
+                    if user and user.role == "admin":
+                        return ApiConsumer(
+                            name=f"admin:{user.email}",
+                            api_key="virtual",
+                            api_key_prefix="jwt",
+                            is_active=True,
+                        )
+            except JWTError:
+                pass
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="X-API-Key header required")
 
     key_hash = hash_api_key(raw_key)

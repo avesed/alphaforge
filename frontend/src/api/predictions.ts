@@ -3,7 +3,6 @@ import type {
   TaskStatus,
   PredictionModel,
   StockPrediction,
-  PerformanceMetric,
 } from '@/types'
 
 export interface TriggerPredictionParams {
@@ -13,16 +12,15 @@ export interface TriggerPredictionParams {
 
 export interface PredictionLatestResponse {
   market: string
-  predictionDate: string
-  modelDate: string
-  forwardDays: number
+  predictionDate: string | null
+  count: number
   predictions: StockPrediction[]
-  qualityPassed: boolean
 }
 
 export interface PredictionHistoryResponse {
   market: string
-  dates: string[]
+  days: number
+  count: number
   predictions: StockPrediction[]
 }
 
@@ -35,17 +33,10 @@ export interface FeatureImportance {
 export interface AccuracyResponse {
   market: string
   days: number
-  overall: {
-    hitRate: number
-    avgIc: number
-    avgIcir: number
-  }
-  daily: Array<{
-    date: string
-    hitRate: number
-    ic: number
-    symbolCount: number
-  }>
+  totalPredictions: number
+  directionAccuracy: number | null
+  ic: number | null
+  icir: number | null
 }
 
 export interface IcDecayResponse {
@@ -76,6 +67,44 @@ export interface PredictionDatesResponse {
   dates: string[]
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function transformModel(m: any): PredictionModel {
+  return {
+    id: m.id,
+    market: m.market,
+    modelDate: m.model_date ?? m.modelDate,
+    modelType: m.model_type ?? m.modelType ?? 'ranking',
+    forwardDays: m.forward_days ?? m.forwardDays ?? 5,
+    ic: m.ic ?? null,
+    icir: m.icir ?? null,
+    ndcg: m.ndcg ?? null,
+    qualityPassed: m.quality === 'approved' || m.quality_passed === true || m.qualityPassed === true,
+    featureCount: m.feature_count ?? m.featureCount ?? null,
+    symbolCount: m.symbol_count ?? m.symbolCount ?? null,
+    createdAt: m.created_at ?? m.createdAt ?? '',
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function transformPrediction(p: any): StockPrediction {
+  const upProb = p.up_probability ?? p.upProbability ?? 0.5
+  let direction: 'up' | 'down' | 'neutral' = 'neutral'
+  if (upProb > 0.55) direction = 'up'
+  else if (upProb < 0.45) direction = 'down'
+
+  return {
+    id: p.id,
+    market: p.market,
+    predictionDate: p.prediction_date ?? p.predictionDate ?? '',
+    symbol: p.symbol,
+    predictedScore: p.rank_score ?? p.predictedScore ?? 0,
+    percentileRank: (p.percentile_rank ?? p.percentileRank ?? 0) * 100,
+    predictedDirection: p.predicted_direction ?? p.predictedDirection ?? direction,
+    actualReturn: p.actual_return ?? p.actualReturn ?? null,
+    forwardDays: p.forward_days ?? p.forwardDays ?? 5,
+  }
+}
+
 export const predictionsApi = {
   // Trigger
   triggerPrediction: (market: string, forceRetrain = false, forwardDays = 5) =>
@@ -89,25 +118,59 @@ export const predictionsApi = {
 
   // Results
   getLatest: (market: string, topN = 50) =>
-    apiClient.get<PredictionLatestResponse>(`/predictions/${market}/latest`, {
+    apiClient.get(`/predictions/${market}/latest`, {
       params: { top_n: topN },
+    }).then(r => {
+      const raw = r.data
+      const predictions = (raw.predictions ?? []).map(transformPrediction)
+      const data: PredictionLatestResponse = {
+        market: raw.market,
+        predictionDate: predictions.length > 0 ? predictions[0].predictionDate : null,
+        count: raw.count ?? predictions.length,
+        predictions,
+      }
+      return { ...r, data }
     }),
 
   getHistory: (market: string, days = 30) =>
-    apiClient.get<PredictionHistoryResponse>(`/predictions/${market}/history`, {
+    apiClient.get(`/predictions/${market}/history`, {
       params: { days },
+    }).then(r => {
+      const raw = r.data
+      const data: PredictionHistoryResponse = {
+        market: raw.market,
+        days: raw.days,
+        count: raw.count,
+        predictions: (raw.predictions ?? []).map(transformPrediction),
+      }
+      return { ...r, data }
     }),
 
   // Models
   getModels: (market?: string) =>
-    apiClient.get<PredictionModel[]>('/predictions/models', {
+    apiClient.get('/predictions/models', {
       params: market ? { market } : {},
-    }),
+    }).then(r => ({
+      ...r,
+      data: (r.data.models ?? r.data ?? []).map(transformModel) as PredictionModel[],
+    })),
 
   getFeatureImportance: (modelId: string) =>
-    apiClient.get<FeatureImportance[]>(
-      `/predictions/models/${modelId}/feature-importance`
-    ),
+    apiClient.get(`/predictions/models/${modelId}/feature-importance`).then(r => {
+      const raw = r.data
+      const top30 = raw.top30 ?? {}
+      let features: FeatureImportance[]
+      if (Array.isArray(top30)) {
+        features = top30
+      } else {
+        features = Object.entries(top30).map(([feature, importance], idx) => ({
+          feature,
+          importance: importance as number,
+          rank: idx + 1,
+        }))
+      }
+      return { ...r, data: features }
+    }),
 
   updateModelQuality: (modelId: string, passed: boolean) =>
     apiClient.put(`/predictions/models/${modelId}/quality`, {
@@ -116,14 +179,28 @@ export const predictionsApi = {
 
   // Analytics
   getAccuracy: (market: string, days = 30) =>
-    apiClient.get<AccuracyResponse>(`/predictions/${market}/accuracy`, {
+    apiClient.get(`/predictions/${market}/accuracy`, {
       params: { days },
+    }).then(r => {
+      const raw = r.data
+      const data: AccuracyResponse = {
+        market: raw.market,
+        days: raw.days,
+        totalPredictions: raw.total_predictions ?? raw.totalPredictions ?? 0,
+        directionAccuracy: raw.direction_accuracy ?? raw.directionAccuracy ?? null,
+        ic: raw.ic ?? null,
+        icir: raw.icir ?? null,
+      }
+      return { ...r, data }
     }),
 
   getPerformance: (market: string, days = 30) =>
-    apiClient.get<PerformanceMetric[]>(`/predictions/${market}/performance`, {
+    apiClient.get(`/predictions/${market}/performance`, {
       params: { days },
-    }),
+    }).then(r => ({
+      ...r,
+      data: r.data.data ?? r.data ?? [],
+    })),
 
   getIcDecay: (market: string, days = 30) =>
     apiClient.get<IcDecayResponse>(`/predictions/${market}/ic-decay`, {
