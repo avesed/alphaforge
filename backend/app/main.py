@@ -61,9 +61,11 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     from app.executor import shutdown_executors
+    from app.api.public.indicators import shutdown_indicator_executor
     from app.services.stockpulse_client import close_stockpulse_async_client
 
     shutdown_executors()
+    shutdown_indicator_executor()
     await stop_scheduler()
     await close_stockpulse_async_client()
     await close_db_pool()
@@ -114,11 +116,13 @@ def create_app() -> FastAPI:
     from app.api.public.expression import router as expression_router
     from app.api.public.backtests import router as backtests_router
     from app.api.public.data import router as data_router
+    from app.api.public.indicators import router as indicators_router
 
     app.include_router(factors_router, prefix="/api/v1")
     app.include_router(expression_router, prefix="/api/v1")
     app.include_router(backtests_router, prefix="/api/v1")
     app.include_router(data_router, prefix="/api/v1")
+    app.include_router(indicators_router, prefix="/api/v1")
 
     # ML routes (require lightgbm, scikit-learn, etc.)
     _ml_routes = [
