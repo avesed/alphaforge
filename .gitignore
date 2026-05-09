@@ -9,4 +9,8 @@ frontend/dist/
 .vite/
 .venv/
 *.log
+*.tsbuildinfo
+*.d.ts
+!frontend/src/**/*.d.ts
+frontend/vitest.config.js
 CLAUDE.md
