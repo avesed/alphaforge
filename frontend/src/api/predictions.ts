@@ -68,7 +68,7 @@ export interface PredictionDatesResponse {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function transformModel(m: any): PredictionModel {
+export function transformModel(m: any): PredictionModel {
   return {
     id: m.id,
     market: m.market,
@@ -86,7 +86,7 @@ function transformModel(m: any): PredictionModel {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function transformPrediction(p: any): StockPrediction {
+export function transformPrediction(p: any): StockPrediction {
   const upProb = p.up_probability ?? p.upProbability ?? 0.5
   let direction: 'up' | 'down' | 'neutral' = 'neutral'
   if (upProb > 0.55) direction = 'up'

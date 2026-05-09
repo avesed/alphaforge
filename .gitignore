@@ -7,5 +7,6 @@ build/
 node_modules/
 frontend/dist/
 .vite/
+.venv/
 *.log
 CLAUDE.md
