@@ -133,12 +133,12 @@ async def update_consumer(
 
 
 @router.delete("/{consumer_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def deactivate_consumer(
+async def delete_consumer(
     consumer_id: UUID,
     admin: User = Depends(require_admin),
     db: AsyncSession = Depends(get_db),
 ):
-    """Deactivate an API consumer (soft delete)."""
+    """Permanently delete an API consumer."""
     result = await db.execute(
         select(ApiConsumer).where(ApiConsumer.id == consumer_id)
     )
@@ -146,6 +146,5 @@ async def deactivate_consumer(
     if consumer is None:
         raise HTTPException(status_code=404, detail="Consumer not found")
 
-    consumer.is_active = False
-    consumer.updated_at = datetime.now(timezone.utc)
-    logger.info("Admin %s deactivated consumer %s", admin.email, consumer_id)
+    await db.delete(consumer)
+    logger.info("Admin %s deleted consumer %s (%s)", admin.email, consumer_id, consumer.name)

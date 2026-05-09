@@ -13,13 +13,8 @@ export interface UpdateConsumerParams {
   isActive?: boolean
 }
 
-export interface ConsumerListResponse {
-  consumers: ApiConsumer[]
-  total: number
-}
-
 export const consumersApi = {
-  list: () => apiClient.get<ConsumerListResponse>('/admin/consumers'),
+  list: () => apiClient.get<ApiConsumer[]>('/admin/consumers'),
 
   create: (name: string, description?: string) =>
     apiClient.post<ApiConsumerWithKey>('/admin/consumers', {
@@ -31,5 +26,8 @@ export const consumersApi = {
     apiClient.put<ApiConsumer>(`/admin/consumers/${id}`, data),
 
   deactivate: (id: string) =>
+    apiClient.put<ApiConsumer>(`/admin/consumers/${id}`, { isActive: false }),
+
+  delete: (id: string) =>
     apiClient.delete(`/admin/consumers/${id}`),
 }

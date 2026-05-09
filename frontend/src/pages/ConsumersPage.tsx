@@ -12,6 +12,7 @@ import {
   Loader2,
   Key,
   Shield,
+  Trash2,
 } from 'lucide-react'
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -183,14 +184,14 @@ function CreateConsumerForm({
 function ConsumerRow({ consumer }: { consumer: ApiConsumer }) {
   const { toast } = useToast()
   const queryClient = useQueryClient()
-  const [confirming, setConfirming] = useState(false)
+  const [confirmAction, setConfirmAction] = useState<'deactivate' | 'delete' | null>(null)
 
   const deactivateMutation = useMutation({
     mutationFn: () => consumersApi.deactivate(consumer.id),
     onSuccess: () => {
       toast({ title: 'Consumer deactivated' })
       void queryClient.invalidateQueries({ queryKey: ['consumers'] })
-      setConfirming(false)
+      setConfirmAction(null)
     },
     onError: (err) => {
       toast({
@@ -198,9 +199,28 @@ function ConsumerRow({ consumer }: { consumer: ApiConsumer }) {
         description: getErrorMessage(err),
         variant: 'destructive',
       })
-      setConfirming(false)
+      setConfirmAction(null)
     },
   })
+
+  const deleteMutation = useMutation({
+    mutationFn: () => consumersApi.delete(consumer.id),
+    onSuccess: () => {
+      toast({ title: 'Consumer deleted' })
+      void queryClient.invalidateQueries({ queryKey: ['consumers'] })
+      setConfirmAction(null)
+    },
+    onError: (err) => {
+      toast({
+        title: 'Delete failed',
+        description: getErrorMessage(err),
+        variant: 'destructive',
+      })
+      setConfirmAction(null)
+    },
+  })
+
+  const isPending = deactivateMutation.isPending || deleteMutation.isPending
 
   return (
     <tr className="border-b border-border/50 last:border-0">
@@ -218,43 +238,56 @@ function ConsumerRow({ consumer }: { consumer: ApiConsumer }) {
         <StatusBadge active={consumer.isActive} />
       </td>
       <td className="p-4">
-        {consumer.isActive && (
-          <>
-            {confirming ? (
-              <div className="flex gap-1">
-                <Button
-                  variant="destructive"
-                  size="sm"
-                  className="h-7 text-xs"
-                  disabled={deactivateMutation.isPending}
-                  onClick={() => deactivateMutation.mutate()}
-                >
-                  {deactivateMutation.isPending ? (
-                    <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                  ) : null}
-                  Confirm
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-7 text-xs"
-                  onClick={() => setConfirming(false)}
-                >
-                  Cancel
-                </Button>
-              </div>
-            ) : (
+        {confirmAction != null ? (
+          <div className="flex gap-1">
+            <Button
+              variant="destructive"
+              size="sm"
+              className="h-7 text-xs"
+              disabled={isPending}
+              onClick={() =>
+                confirmAction === 'delete'
+                  ? deleteMutation.mutate()
+                  : deactivateMutation.mutate()
+              }
+            >
+              {isPending ? (
+                <Loader2 className="mr-1 h-3 w-3 animate-spin" />
+              ) : null}
+              {confirmAction === 'delete' ? 'Delete' : 'Deactivate'}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs"
+              onClick={() => setConfirmAction(null)}
+            >
+              Cancel
+            </Button>
+          </div>
+        ) : (
+          <div className="flex gap-1">
+            {consumer.isActive && (
               <Button
                 variant="ghost"
                 size="sm"
-                className="h-7 text-xs text-destructive hover:text-destructive"
-                onClick={() => setConfirming(true)}
+                className="h-7 text-xs text-muted-foreground hover:text-foreground"
+                onClick={() => setConfirmAction('deactivate')}
               >
                 <XCircle className="mr-1 h-3 w-3" />
                 Deactivate
               </Button>
             )}
-          </>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-7 text-xs text-destructive hover:text-destructive"
+              onClick={() => setConfirmAction('delete')}
+            >
+              <Trash2 className="mr-1 h-3 w-3" />
+              Delete
+            </Button>
+          </div>
         )}
       </td>
     </tr>
@@ -270,7 +303,7 @@ export default function ConsumersPage() {
     queryFn: () => consumersApi.list().then((r) => r.data),
   })
 
-  const consumers: ApiConsumer[] = consumersQuery.data?.consumers ?? []
+  const consumers: ApiConsumer[] = consumersQuery.data ?? []
 
   return (
     <div className="space-y-6">
