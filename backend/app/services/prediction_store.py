@@ -9,6 +9,7 @@ its own session via get_session_factory().
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -24,6 +25,22 @@ from app.models.prediction_model import PredictionModel
 logger = logging.getLogger(__name__)
 
 
+def deterministic_model_id(
+    market: str, model_date: date, forward_days: int, model_type: str,
+) -> str:
+    """Reconstruct the deterministic model id used by the training pipeline.
+
+    Mirrors the hashing in prediction_service._record_model and
+    direction_service._record_direction_model:
+        sha256(f"{market}:{date.isoformat()}:{forward_days}:{model_type}")[:32]
+
+    The model_type segment in the seed is the *id seed token* used by the
+    recorders: "ranking" for the ranking model, "direction" for direction.
+    """
+    id_seed = f"{market}:{model_date.isoformat()}:{forward_days}:{model_type}"
+    return hashlib.sha256(id_seed.encode()).hexdigest()[:32]
+
+
 def _date_from_value(v: Any) -> date | None:
     """Coerce a string, datetime, or date to a date object."""
     if v is None:
@@ -37,8 +54,21 @@ def _date_from_value(v: Any) -> date | None:
     return v
 
 
-def _prediction_to_dict(row: StockPrediction) -> dict[str, Any]:
-    """Convert a StockPrediction ORM instance to a plain dict."""
+def _prediction_to_dict(
+    row: StockPrediction, quality: str | None = None,
+) -> dict[str, Any]:
+    """Convert a StockPrediction ORM instance to a plain dict.
+
+    Args:
+        row: the StockPrediction ORM instance.
+        quality: the quality of the serving model that produced this row
+            (resolved via a LEFT JOIN on prediction_models). When the
+            serving model is ``rejected``, the row is additively tagged
+            ``low_confidence=True`` so consumers can flag it. Rows whose
+            ``model_id`` is NULL (legacy data) or whose model is missing
+            carry ``quality=None`` and ``low_confidence=False``.
+    """
+    low_confidence = quality == "rejected"
     return {
         "id": row.id,
         "market": row.market,
@@ -50,6 +80,8 @@ def _prediction_to_dict(row: StockPrediction) -> dict[str, Any]:
         "up_probability": row.up_probability,
         "actual_return": row.actual_return,
         "model_id": row.model_id,
+        "quality": quality,
+        "low_confidence": low_confidence,
         "created_at": row.created_at.isoformat() if row.created_at else None,
     }
 
@@ -188,6 +220,14 @@ class PredictionStore:
         Finds the most recent prediction_date for the given market,
         then returns up to top_n predictions from that date.
         Filters by forward_days and/or symbol when provided.
+
+        LEFT JOINs prediction_models to EXPOSE (not filter on) the serving
+        model's quality. Rejected-model rows pass through tagged
+        ``low_confidence=True``; rows with NULL model_id (legacy data) or a
+        missing model pass through with ``quality=None``. This deliberately
+        does NOT hide rejected rows -- the serving policy (decision 1) writes
+        the actual serving model_id, and consumers decide how to surface the
+        quality tag.
         """
         factory = get_session_factory()
 
@@ -216,16 +256,22 @@ class PredictionStore:
             if symbol is not None:
                 filters.append(StockPrediction.symbol == symbol)
 
+            # LEFT JOIN prediction_models so NULL model_id rows are retained
+            # and we can additively expose pm.quality per row.
             stmt = (
-                select(StockPrediction)
+                select(StockPrediction, PredictionModel.quality)
+                .outerjoin(
+                    PredictionModel,
+                    StockPrediction.model_id == PredictionModel.id,
+                )
                 .where(and_(*filters))
                 .order_by(desc(StockPrediction.rank_score))
                 .limit(top_n)
             )
             result = await session.execute(stmt)
-            rows = result.scalars().all()
+            rows = result.all()
 
-        return [_prediction_to_dict(r) for r in rows]
+        return [_prediction_to_dict(r[0], quality=r[1]) for r in rows]
 
     async def get_prediction_history(
         self, market: str, days: int = 30
@@ -496,6 +542,79 @@ class PredictionStore:
             rows = result.scalars().all()
 
         return [_model_to_dict(r) for r in rows]
+
+    async def get_latest_approved_model(
+        self,
+        market: str,
+        model_type: str = "ranking",
+        forward_days: int = 5,
+        before_date: date | None = None,
+    ) -> dict | None:
+        """Return the most recent approved model for (market, type, horizon).
+
+        Used by the serving/fallback policy (decision 1/2a): when today's
+        candidate is rejected, fall back to the latest *approved* model from
+        a prior date rather than serving the just-rejected one.
+
+        Args:
+            market: market code (lowercase).
+            model_type: ``ranking`` or ``direction``.
+            forward_days: prediction horizon.
+            before_date: when provided, only models strictly older than this
+                date are considered (used to exclude today's rejected model).
+
+        Returns:
+            Model dict (same shape as ``get_models``) or None when no approved
+            model exists for the criteria.
+        """
+        factory = get_session_factory()
+
+        async with factory() as session:
+            conditions = [
+                PredictionModel.market == market,
+                PredictionModel.model_type == model_type,
+                PredictionModel.forward_days == forward_days,
+                PredictionModel.quality == "approved",
+            ]
+            if before_date is not None:
+                conditions.append(PredictionModel.model_date < before_date)
+
+            stmt = (
+                select(PredictionModel)
+                .where(and_(*conditions))
+                .order_by(desc(PredictionModel.model_date), desc(PredictionModel.created_at))
+                .limit(1)
+            )
+            result = await session.execute(stmt)
+            row = result.scalar_one_or_none()
+
+        return _model_to_dict(row) if row is not None else None
+
+    async def get_model_quality(
+        self,
+        market: str,
+        model_date: date,
+        forward_days: int,
+        model_type: str,
+    ) -> str | None:
+        """Look up a model's quality via its deterministic id.
+
+        DB is authoritative for quality (decision 3); this is the fallback for
+        the on-disk marker. The id seed token is "ranking"/"direction" (the
+        recorder seed), matching ``deterministic_model_id``.
+
+        Returns the quality string (pending/approved/rejected) or None when
+        no matching model row exists.
+        """
+        model_id = deterministic_model_id(market, model_date, forward_days, model_type)
+        factory = get_session_factory()
+
+        async with factory() as session:
+            stmt = select(PredictionModel.quality).where(PredictionModel.id == model_id)
+            result = await session.execute(stmt)
+            quality = result.scalar_one_or_none()
+
+        return quality
 
     async def update_model_quality(self, model_id: str, quality: str) -> None:
         """Update model quality status (pending/approved/rejected)."""

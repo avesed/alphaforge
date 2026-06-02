@@ -65,6 +65,23 @@ class MarketConfig:
         IC differs (e.g. HK=0.009 is below the global default of 0.01).
     min_icir_threshold : float
         Minimum ICIR to pass quality gate.
+    min_t_stat : float
+        Minimum pooled-IC t-statistic to pass the significance quality gate
+        (Batch C). t_stat = pooled_icir * sqrt(N) where N is the total number
+        of validation dates pooled across all walk-forward folds. 2.0 ~ 98%
+        one-sided confidence that the IC is genuinely positive. HK uses a
+        looser 1.65 (~95%) because its baseline IC is weaker (~0.009) and a
+        strict gate would reject every model. Only enforced as the binding
+        decision when ``QUALITY_GATE_ENFORCE_SIGNIFICANCE`` is true; otherwise
+        computed in shadow mode for calibration.
+    min_validation_days : int
+        Minimum number of pooled per-date IC observations (N) required for the
+        significance gate. Below this, the t-statistic is too noisy to trust,
+        so the new gate fails. Independent of ``min_t_stat``.
+    require_all_folds_positive : bool
+        When true, every walk-forward fold's mean IC must be strictly positive
+        (min(fold_ics) > 0) for the significance gate to pass. Guards against a
+        model that looks good on pooled IC but is negative in one regime.
 
     Market-level features
     ---------------------
@@ -94,6 +111,18 @@ class MarketConfig:
     direction_max_brier : float
         Maximum Brier score to pass the direction model quality gate.
         Lower is better. Default 0.25 (uncalibrated baseline ~0.25).
+
+    SLA monitoring
+    --------------
+    sla_max_model_age_days : int
+        Maximum acceptable age (calendar days) of the freshest model for this
+        market before the daily SLA check raises a structured WARNING and the
+        admin scheduler surface reports a breach. HK is given a wider window
+        because its training cadence + data coverage are sparser.
+    sla_max_prediction_lag_days : int
+        Maximum acceptable lag (calendar days) between today and the freshest
+        ``stock_predictions.prediction_date`` for this market before the SLA
+        check flags a breach. HK is wider for the same reason.
     """
 
     # Training mode
@@ -111,6 +140,12 @@ class MarketConfig:
     # Quality gate (per-market overrides for global PREDICTION_MIN_IC/ICIR)
     min_ic_threshold: float = 0.01
     min_icir_threshold: float = 0.10
+    # Significance quality gate (Batch C). Only enforced as the binding
+    # approved/rejected decision when QUALITY_GATE_ENFORCE_SIGNIFICANCE=true;
+    # otherwise computed in shadow mode for calibration.
+    min_t_stat: float = 2.0
+    min_validation_days: int = 60
+    require_all_folds_positive: bool = True
     # LightGBM hyperparameters
     lgb_overrides: dict[str, Any] = field(default_factory=dict)
     num_boost_round: int = 1000
@@ -119,6 +154,9 @@ class MarketConfig:
     direction_lgb_overrides: dict[str, Any] = field(default_factory=dict)
     direction_min_auc: float = 0.52
     direction_max_brier: float = 0.255
+    # SLA monitoring (Batch D). HK gets a wider window (sparser cadence/data).
+    sla_max_model_age_days: int = 10
+    sla_max_prediction_lag_days: int = 5
 
 
 MARKET_CONFIGS: dict[str, MarketConfig] = {
@@ -192,6 +230,11 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         index_symbol="^HSI",
         min_ic_threshold=0.005,
         min_icir_threshold=0.05,
+        # HK baseline IC=0.009 -- a strict 2.0 t-stat gate would reject every
+        # model, so use a looser 1.65 (~95% one-sided). This only takes effect
+        # once QUALITY_GATE_ENFORCE_SIGNIFICANCE=true; in shadow mode it merely
+        # changes what the logged "would decide" verdict is for HK.
+        min_t_stat=1.65,
         lgb_overrides={
             "learning_rate": 0.05,
             "num_leaves": 63,
@@ -207,6 +250,9 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
             "min_child_samples": 100,
             "lambda_l2": 5.0,
         },
+        # HK trains less frequently and has sparser data coverage -> wider SLA.
+        sla_max_model_age_days=21,
+        sla_max_prediction_lag_days=10,
     ),
 }
 

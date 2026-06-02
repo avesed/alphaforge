@@ -23,6 +23,7 @@ AlphaForge adaptation:
 """
 
 import asyncio
+import bisect
 import hashlib
 import json
 import logging
@@ -49,7 +50,7 @@ from app.services.feature_service import (
     feature_service,
 )
 from app.services.market_config import MarketConfig, get_market_config
-from app.services.prediction_store import prediction_store
+from app.services.prediction_store import deterministic_model_id, prediction_store
 from app.services.stockpulse_client import get_stockpulse_async_client
 
 logger = logging.getLogger(__name__)
@@ -154,6 +155,53 @@ async def _get_redis_client() -> aioredis.Redis:
 
 def _prediction_cache_key(market: str) -> str:
     return f"pred:latest:{market}"
+
+
+# ---------------------------------------------------------------------------
+# Quality markers (on-disk hot-path cache for model quality; DB authoritative)
+# ---------------------------------------------------------------------------
+
+
+def _quality_marker_name(model_type: str, forward_days: int) -> str:
+    """Marker filename, e.g. ``quality.ranking.5.json``.
+
+    The forward_days segment future-proofs multiple horizons sharing a date
+    directory; ranking and direction markers are independent and never
+    overwrite each other.
+    """
+    return f"quality.{model_type}.{forward_days}.json"
+
+
+def _write_quality_marker(
+    model_dir: str, model_type: str, forward_days: int, quality: str,
+) -> None:
+    """Best-effort write of the on-disk quality marker.
+
+    DB is authoritative (decision 3); the marker is a hot-path cache, so a
+    write failure is logged and swallowed -- reads fall back to the DB.
+    """
+    path = os.path.join(model_dir, _quality_marker_name(model_type, forward_days))
+    try:
+        with open(path, "w") as f:
+            json.dump({"quality": quality}, f)
+    except OSError as e:
+        logger.warning("Failed to write quality marker %s: %s", path, e)
+
+
+def _read_quality_marker(
+    model_dir: str, model_type: str, forward_days: int,
+) -> Optional[str]:
+    """Read the on-disk quality marker; returns None if absent/unreadable."""
+    path = os.path.join(model_dir, _quality_marker_name(model_type, forward_days))
+    if not os.path.exists(path):
+        return None
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        quality = data.get("quality")
+        return quality if isinstance(quality, str) else None
+    except (OSError, ValueError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -306,7 +354,28 @@ class PredictionService:
         force_retrain: bool,
     ) -> None:
         n_horizons = len(horizons)
-        prediction_date = date.today()
+        # Trading-day guard (Batch D, decision 10): cheap weekend early-return
+        # so the daily scheduler never produces weekend orphan rows across any
+        # horizon or the direction model. force_retrain bypasses.
+        cal_today = date.today()
+        if cal_today.weekday() >= 5 and not force_retrain:
+            skip_msg = (
+                f"Non-trading day (weekend {cal_today.isoformat()}), "
+                f"skipping to avoid orphan rows"
+            )
+            logger.info(
+                "Multi-horizon: skipping prediction for %s: %s", market, skip_msg,
+            )
+            task.status = "completed"
+            task.progress = 100.0
+            task.completed_at = datetime.now()
+            task.message = f"Skipped: {skip_msg}"
+            task.results = {"market": market, "skipped": True, "reason": skip_msg}
+            return
+        # Align the direction-step prediction_date to the latest trading day
+        # (the per-horizon ranking runs align independently inside
+        # _run_prediction_async). Fail-open to today if calendar unavailable.
+        prediction_date = self._resolve_prediction_date(market, cal_today)
         try:
             for i, h in enumerate(horizons):
                 pct_base = (i / n_horizons) * 90
@@ -477,12 +546,32 @@ class PredictionService:
             logger.error("Failed to query prediction history: %s", e)
             return []
 
-    async def backfill_returns(self) -> dict:
-        """Backfill actual returns for past predictions via local PredictionStore."""
+    async def backfill_returns(
+        self, markets: Optional[tuple[str, ...]] = None,
+    ) -> dict:
+        """Backfill actual returns for past predictions via local PredictionStore.
+
+        Parameters
+        ----------
+        markets:
+            Optional tuple of market codes to restrict the backfill to (e.g.
+            ``("cn",)`` for the per-market chained backfill that runs right
+            after a market's qlib sync). ``None`` backfills all markets (the
+            daily fallback job). Unknown codes are ignored; empty/invalid
+            input falls back to all markets for safety.
+        """
         try:
-            # Get candidates from all markets
+            default_markets = ("us", "hk", "cn")
+            if markets:
+                selected = tuple(
+                    m.lower() for m in markets if m and m.lower() in default_markets
+                )
+                target_markets = selected or default_markets
+            else:
+                target_markets = default_markets
+            # Get candidates from the selected markets
             all_updates: list[dict] = []
-            for mkt in ("us", "hk", "cn"):
+            for mkt in target_markets:
                 candidates = await prediction_store.get_predictions_for_backfill(mkt)
                 if not candidates:
                     continue
@@ -527,6 +616,115 @@ class PredictionService:
         except Exception as e:
             logger.error("Backfill failed: %s", e)
             return {"error": str(e)}
+
+    async def compute_sla_status(
+        self, markets: tuple[str, ...] = ("us", "hk", "cn"),
+    ) -> dict:
+        """Compute per-market freshness SLA status (Batch D / decision 9).
+
+        For each market compares:
+          * freshest ``prediction_models.model_date`` age (calendar days)
+            against ``MarketConfig.sla_max_model_age_days``;
+          * freshest ``stock_predictions.prediction_date`` lag against
+            ``MarketConfig.sla_max_prediction_lag_days``.
+
+        Returns a structured dict suitable for persisting to Redis and for the
+        admin scheduler surface. ``breach`` is True when ANY market exceeds
+        either threshold. Per-market errors are isolated (one bad market does
+        not abort the whole check). Each ``get_models`` / ``get_latest_*`` call
+        opens its OWN session, so no concurrent-query-on-one-connection issue.
+        """
+        today = date.today()
+        per_market: list[dict] = []
+        any_breach = False
+
+        for market in markets:
+            entry: dict[str, Any] = {
+                "market": market,
+                "model_age_days": None,
+                "max_model_age_days": None,
+                "model_age_breach": False,
+                "prediction_lag_days": None,
+                "max_prediction_lag_days": None,
+                "prediction_lag_breach": False,
+                "latest_model_date": None,
+                "latest_prediction_date": None,
+                "error": None,
+            }
+            try:
+                cfg = get_market_config(market)
+                entry["max_model_age_days"] = cfg.sla_max_model_age_days
+                entry["max_prediction_lag_days"] = cfg.sla_max_prediction_lag_days
+
+                # --- freshest model date (sequential; own session) ---
+                try:
+                    models = await prediction_store.get_models(market)
+                except Exception as exc:
+                    models = []
+                    logger.warning(
+                        "SLA: failed to fetch models for %s: %s", market, exc,
+                    )
+                model_dates: list[date] = []
+                for m in models or []:
+                    mds = m.get("model_date")
+                    if not mds:
+                        continue
+                    try:
+                        model_dates.append(date.fromisoformat(mds))
+                    except (ValueError, TypeError):
+                        continue
+                if model_dates:
+                    latest_model = max(model_dates)
+                    age = (today - latest_model).days
+                    entry["latest_model_date"] = latest_model.isoformat()
+                    entry["model_age_days"] = age
+                    entry["model_age_breach"] = age > cfg.sla_max_model_age_days
+                else:
+                    # No model at all is itself an SLA breach.
+                    entry["model_age_breach"] = True
+
+                # --- freshest prediction date (sequential; own session) ---
+                try:
+                    preds = await prediction_store.get_latest_predictions(
+                        market, top_n=1,
+                    )
+                except Exception as exc:
+                    preds = []
+                    logger.warning(
+                        "SLA: failed to fetch predictions for %s: %s",
+                        market, exc,
+                    )
+                pred_date: Optional[date] = None
+                if preds:
+                    pds = preds[0].get("prediction_date")
+                    if pds:
+                        try:
+                            pred_date = date.fromisoformat(pds)
+                        except (ValueError, TypeError):
+                            pred_date = None
+                if pred_date is not None:
+                    lag = (today - pred_date).days
+                    entry["latest_prediction_date"] = pred_date.isoformat()
+                    entry["prediction_lag_days"] = lag
+                    entry["prediction_lag_breach"] = (
+                        lag > cfg.sla_max_prediction_lag_days
+                    )
+                else:
+                    entry["prediction_lag_breach"] = True
+
+            except Exception as exc:
+                entry["error"] = str(exc)
+                logger.warning("SLA: check failed for %s: %s", market, exc)
+
+            if entry["model_age_breach"] or entry["prediction_lag_breach"]:
+                any_breach = True
+            per_market.append(entry)
+
+        return {
+            "checked_at": datetime.now().isoformat(),
+            "breach": any_breach,
+            "markets": per_market,
+        }
 
     async def check_retrain_needed(self, market: str) -> bool:
         try:
@@ -625,11 +823,49 @@ class PredictionService:
                 task.results = {"market": market, "skipped": True, "reason": freshness_msg}
                 return
 
+            # Step 1.6: Trading-day guard (Batch D, decision 10).
+            # The daily scheduler fires every calendar day, so without a guard
+            # weekend/holiday runs write non-trading-day prediction_date rows
+            # that can NEVER be backfilled (no close price for that date).
+            #
+            #  (a) Cheap weekend early-return: Sat/Sun is never a trading day in
+            #      any of our markets -- skip without touching the calendar or
+            #      doing any expensive work. force_retrain bypasses (an admin
+            #      explicitly asked to retrain).
+            #  (b) prediction_date alignment: for weekdays (incl. holidays) we
+            #      align the written date to the latest trading day on-or-before
+            #      today so every row is backfillable. Holidays therefore reuse
+            #      the prior trading day's date (idempotent upsert).
+            cal_today = date.today()
+            if cal_today.weekday() >= 5 and not force_retrain:
+                skip_msg = (
+                    f"Non-trading day (weekend {cal_today.isoformat()}), "
+                    f"skipping to avoid orphan rows"
+                )
+                logger.info("Skipping prediction for %s: %s", market, skip_msg)
+                if _skip_completion:
+                    task.message = f"[{forward_days}d] Skipped: {skip_msg}"
+                    return
+                task.status = "completed"
+                task.progress = 100.0
+                task.completed_at = datetime.now()
+                task.message = f"Skipped: {skip_msg}"
+                task.results = {"market": market, "skipped": True, "reason": skip_msg}
+                return
+
             # Step 2: Check if retraining is needed
-            today = date.today()
+            settings = get_settings()
+            binding = settings.QUALITY_GATE_BINDING
+            # Align the prediction date to the actual data day (latest trading
+            # day on-or-before today). Fail-open to today if the calendar is
+            # unavailable. ``today`` below is therefore the aligned trading day.
+            today = self._resolve_prediction_date(market, cal_today)
             model_id: Optional[Any] = None
             model_path: Optional[str] = None
             trained_this_run = False
+            # serving_quality drives the low_confidence tag on written rows +
+            # cache; default "approved" (existing-model reuse / passed gate).
+            serving_quality: str = "approved"
 
             if not force_retrain:
                 existing = self._check_existing_model_on_disk(market, today, forward_days)
@@ -638,6 +874,27 @@ class PredictionService:
                     logger.info("Existing model found for %s/%s", market, today.isoformat())
                     task.message = f"[{forward_days}d] Using existing model"
                     task.progress = _p(70)
+                    # Resolve the reused model's id + quality so a rejected
+                    # model already on disk is also subject to the serving
+                    # policy below (binding) and the correct model_id is
+                    # written.
+                    if binding:
+                        existing_quality = await prediction_store.get_model_quality(
+                            market, today, forward_days, "ranking",
+                        )
+                        model_id = deterministic_model_id(
+                            market, today, forward_days, "ranking",
+                        ) if existing_quality is not None else None
+                        if existing_quality == "rejected":
+                            # Treat reuse of a rejected model exactly like a
+                            # fresh rejected gate result.
+                            serving_quality, model_id, model_path = (
+                                await self._resolve_serving_after_reject(
+                                    market, forward_days, today,
+                                    rejected_model_id=model_id,
+                                    rejected_model_path=model_path,
+                                )
+                            )
 
             # Step 3: Train if needed
             quality_passed = True
@@ -648,14 +905,30 @@ class PredictionService:
                 trained_this_run = True
 
                 if not quality_passed:
-                    # Fall back to latest model on disk
-                    fallback = self._find_latest_model_on_disk(market, forward_days)
-                    if fallback:
-                        logger.warning(
-                            "Quality gate failed -- falling back to previous model: %s",
-                            fallback,
+                    if binding:
+                        # Decision 1: prefer the latest prior approved model;
+                        # otherwise serve today's rejected model tagged
+                        # low_confidence (never silently suppress).
+                        serving_quality, model_id, model_path = (
+                            await self._resolve_serving_after_reject(
+                                market, forward_days, today,
+                                rejected_model_id=model_id,
+                                rejected_model_path=model_path,
+                            )
                         )
-                        model_path = fallback
+                    else:
+                        # Legacy behavior (binding disabled): fall back to the
+                        # most recent model on disk regardless of quality.
+                        fallback = self._find_latest_model_on_disk_legacy(
+                            market, forward_days,
+                        )
+                        if fallback:
+                            logger.warning(
+                                "Quality gate failed -- legacy fallback to: %s",
+                                fallback,
+                            )
+                            model_path = fallback
+                        serving_quality = "rejected"
 
             # Step 4: Inference
             task.status = "predicting"
@@ -663,7 +936,8 @@ class PredictionService:
             task.message = f"[{forward_days}d] Running inference"
 
             prediction_count = await self._run_inference(
-                task, market, symbols, model_id, model_path, forward_days, today
+                task, market, symbols, model_id, model_path, forward_days, today,
+                serving_quality=serving_quality,
             )
 
             if _skip_completion:
@@ -685,6 +959,8 @@ class PredictionService:
                 "forward_days": forward_days,
                 "symbol_count": len(symbols),
                 "retrained": trained_this_run,
+                "serving_quality": serving_quality,
+                "low_confidence": serving_quality == "rejected",
             }
             if task._psi_data is not None:
                 task.results["feature_psi"] = task._psi_data
@@ -901,10 +1177,29 @@ class PredictionService:
             return model_path
         return None
 
-    def _find_latest_model_on_disk(
-        self, market: str, forward_days: int,
+    async def _find_latest_model_on_disk(
+        self,
+        market: str,
+        forward_days: int,
+        exclude_date: Optional[date] = None,
+        model_type: str = "ranking",
     ) -> Optional[str]:
-        """Find the latest model file on disk for a market."""
+        """Find the latest *approved* model file on disk for a market.
+
+        Quality-aware fallback resolver (Batch A). Walks date directories
+        newest-first and returns the first one that:
+          1. is not ``exclude_date`` (e.g. today's just-rejected model);
+          2. has the expected model file (ranking=model.pkl,
+             direction=direction_model.pkl);
+          3. is ``approved`` -- checked via the on-disk marker first, then
+             falling back to the DB (decision 3) for the ~38 legacy
+             marker-less directories.
+
+        Returns the model file path, or None when no approved model exists.
+
+        NOTE: when QUALITY_GATE_BINDING is disabled, callers should use the
+        legacy resolver semantics; this method always enforces approved-only.
+        """
         settings = get_settings()
         market_dir = os.path.join(settings.PREDICTION_DATA_DIR, market)
         if not os.path.isdir(market_dir):
@@ -915,11 +1210,124 @@ class PredictionService:
         except OSError:
             return None
 
+        model_filename = "direction_model.pkl" if model_type == "direction" else "model.pkl"
+        exclude_str = exclude_date.strftime("%Y%m%d") if exclude_date is not None else None
+
+        for dirname in date_dirs:
+            if exclude_str is not None and dirname == exclude_str:
+                continue
+
+            dir_path = os.path.join(market_dir, dirname)
+            model_path = os.path.join(dir_path, model_filename)
+            if not os.path.exists(model_path):
+                continue
+
+            # Resolve the model date from the directory name.
+            try:
+                dir_date = date(int(dirname[:4]), int(dirname[4:6]), int(dirname[6:8]))
+            except (ValueError, IndexError):
+                continue
+
+            # 1) marker (hot path)
+            quality = _read_quality_marker(dir_path, model_type, forward_days)
+            # 2) DB fallback when marker absent or non-terminal
+            if quality not in ("approved", "rejected"):
+                try:
+                    quality = await prediction_store.get_model_quality(
+                        market, dir_date, forward_days, model_type,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "DB quality lookup failed for %s/%s: %s",
+                        market, dirname, e,
+                    )
+                    quality = None
+
+            if quality == "approved":
+                return model_path
+
+        return None
+
+    def _find_latest_model_on_disk_legacy(
+        self, market: str, forward_days: int,
+    ) -> Optional[str]:
+        """Legacy (quality-blind) disk resolver -- newest model.pkl.
+
+        Used only when QUALITY_GATE_BINDING is disabled, to preserve the
+        original behavior as a one-flag revert path.
+        """
+        settings = get_settings()
+        market_dir = os.path.join(settings.PREDICTION_DATA_DIR, market)
+        if not os.path.isdir(market_dir):
+            return None
+        try:
+            date_dirs = sorted(os.listdir(market_dir), reverse=True)
+        except OSError:
+            return None
         for dirname in date_dirs:
             model_path = os.path.join(market_dir, dirname, "model.pkl")
             if os.path.exists(model_path):
                 return model_path
         return None
+
+    async def _resolve_serving_after_reject(
+        self,
+        market: str,
+        forward_days: int,
+        model_date: date,
+        rejected_model_id: Optional[Any],
+        rejected_model_path: Optional[str],
+    ) -> tuple[str, Optional[Any], Optional[str]]:
+        """Resolve the serving model when today's candidate is rejected.
+
+        Implements decision 1 (serve-but-tag-low-confidence):
+          (2a) Prefer the latest prior *approved* model (DB authoritative for
+               id + file_path; disk for the actual artifact). The serving rows
+               are written with the approved model's id, so the read-path JOIN
+               derives ``quality='approved'``.
+          (2b) When no approved model has ever existed for this market, serve
+               today's rejected model, returning ``serving_quality='rejected'``
+               so written rows + cache are tagged ``low_confidence``.
+
+        Returns ``(serving_quality, model_id, model_path)``.
+        """
+        approved = await prediction_store.get_latest_approved_model(
+            market, model_type="ranking", forward_days=forward_days,
+            before_date=model_date,
+        )
+        if approved is not None:
+            approved_path = approved.get("file_path")
+            approved_id = approved.get("id")
+            # Tolerate a missing/cleaned artifact: fall back to a disk scan for
+            # any prior approved model before giving up to the rejected one.
+            if not approved_path or not os.path.exists(approved_path):
+                disk_path = await self._find_latest_model_on_disk(
+                    market, forward_days, exclude_date=model_date,
+                    model_type="ranking",
+                )
+                if disk_path is not None:
+                    logger.warning(
+                        "Approved model artifact missing (%s); using disk "
+                        "approved model: %s",
+                        approved_path, disk_path,
+                    )
+                    return "approved", approved_id, disk_path
+            else:
+                logger.warning(
+                    "Quality gate failed for %s/%s -- serving prior approved "
+                    "model (id=%s, date=%s)",
+                    market, model_date.isoformat(),
+                    approved_id, approved.get("model_date"),
+                )
+                return "approved", approved_id, approved_path
+
+        # (2b) No approved model anywhere -> serve today's rejected, tagged.
+        logger.warning(
+            "Quality gate failed for %s/%s and no prior approved model "
+            "exists -- serving today's rejected model tagged low_confidence",
+            market, model_date.isoformat(),
+        )
+        return "rejected", rejected_model_id, rejected_model_path
 
     # ------------------------------------------------------------------
     # Step 3: Training
@@ -1051,6 +1459,11 @@ class PredictionService:
 
         fold_ics: list[float] = []
         fold_icirs: list[float] = []
+        # Per-date IC series for each fold. Walk-forward validation windows are
+        # non-overlapping (see _walk_forward_splits / _evaluate_quality_gate
+        # docstring), so these can be pooled into one distribution for the
+        # significance gate. Stop discarding the series (was "_" previously).
+        all_daily_ics: list[pd.Series] = []
         final_models: list[lgb.Booster] = []
         final_val_df: pd.DataFrame = pd.DataFrame()
         final_val_scores: np.ndarray = np.array([])
@@ -1086,9 +1499,10 @@ class PredictionService:
             va_scores = np.mean(va_scores_list, axis=0)
             va_actual = va_df["forward_return"].values
 
-            _, fold_ic, fold_icir = self._compute_ic_metrics(va_df, va_scores, va_actual)
+            fold_ic_series, fold_ic, fold_icir = self._compute_ic_metrics(va_df, va_scores, va_actual)
             fold_ics.append(fold_ic)
             fold_icirs.append(fold_icir)
+            all_daily_ics.append(fold_ic_series)
 
             logger.info("  Fold %d IC=%.4f, ICIR=%.4f", fold_idx + 1, fold_ic, fold_icir)
 
@@ -1120,18 +1534,31 @@ class PredictionService:
                     ndcg_values.append(ndcg)
         best_ndcg = float(np.mean(ndcg_values)) if ndcg_values else None
 
-        # Quality gate
-        min_ic = cfg.min_ic_threshold
-        min_icir = cfg.min_icir_threshold
-        quality_passed = (ic_mean > min_ic and icir > min_icir)
+        # Quality gate (shared helper -- same logic as train_for_backtest).
+        # In shadow mode (QUALITY_GATE_ENFORCE_SIGNIFICANCE=false, default) the
+        # binding approved/rejected decision is the LEGACY gate; the new
+        # significance gate is computed and logged for calibration. When the
+        # flag is true the significance gate becomes binding.
+        quality_passed, gate_metrics = self._evaluate_quality_gate(
+            fold_ics, fold_icirs, all_daily_ics, cfg,
+        )
 
         if not quality_passed:
             logger.warning(
-                "Model quality gate FAILED: mean_IC=%.4f (min=%.4f), mean_ICIR=%.4f (min=%.4f)",
-                ic_mean, min_ic, icir, min_icir,
+                "Model quality gate FAILED (binding=%s): mean_IC=%.4f (min=%.4f), "
+                "mean_ICIR=%.4f (min=%.4f)",
+                "significance" if gate_metrics["enforce_significance"] else "legacy",
+                ic_mean, cfg.min_ic_threshold, icir, cfg.min_icir_threshold,
             )
         else:
-            logger.info("Model quality gate passed: mean_IC=%.4f, mean_ICIR=%.4f", ic_mean, icir)
+            logger.info(
+                "Model quality gate passed (binding=%s): mean_IC=%.4f, mean_ICIR=%.4f",
+                "significance" if gate_metrics["enforce_significance"] else "legacy",
+                ic_mean, icir,
+            )
+
+        # Always emit the significance-gate shadow verdict for calibration.
+        self._log_significance_shadow(market, forward_days, fold_ics, gate_metrics, cfg)
 
         # Feature importance
         feature_importance: dict[str, float] = {}
@@ -1148,10 +1575,21 @@ class PredictionService:
         except Exception as e:
             logger.warning("Failed to extract feature importance: %s", e)
 
-        # Save model to disk
+        # Save model to disk (marker starts as "pending")
         task.message = "Saving model"
         task.progress = 60.0
-        model_path = self._save_model(models, market, model_date, feature_cols, feature_importance)
+        model_path = self._save_model(
+            models, market, model_date, feature_cols, feature_importance,
+            model_type="ranking", forward_days=forward_days,
+        )
+
+        # Rewrite the on-disk quality marker now that the gate has decided.
+        # DB remains authoritative (decision 3); this is a hot-path cache so
+        # the rewrite is best-effort (handled inside _write_quality_marker).
+        _write_quality_marker(
+            os.path.dirname(model_path), "ranking", forward_days,
+            "approved" if quality_passed else "rejected",
+        )
 
         # Save training distribution snapshot for PSI
         try:
@@ -1195,6 +1633,18 @@ class PredictionService:
                 "walkforward_folds": len(splits),
                 "fold_ics": [round(ic, 6) for ic in fold_ics],
                 "fold_icirs": [round(ir, 6) for ir in fold_icirs],
+                # Significance-gate diagnostics (Batch C, decision 7/8). DB `ic`
+                # column stays = mean(fold_ics); these are stored in
+                # training_config for calibration and historical recompute.
+                "pooled_icir": round(gate_metrics["pooled_icir"], 6),
+                "t_stat": round(gate_metrics["t_stat"], 6),
+                "n_validation_dates": gate_metrics["n_validation_dates"],
+                "min_fold_ic": round(gate_metrics["min_fold_ic"], 6),
+                "pooled_ic_mean": round(gate_metrics["pooled_ic_mean"], 6),
+                "daily_ics": gate_metrics["daily_ics"],
+                "significance_gate_passed": gate_metrics["significance_passed"],
+                "legacy_gate_passed": gate_metrics["legacy_passed"],
+                "significance_gate_enforced": gate_metrics["enforce_significance"],
             },
         )
 
@@ -1305,6 +1755,8 @@ class PredictionService:
 
         fold_ics: list[float] = []
         fold_icirs: list[float] = []
+        # Per-date IC series per fold (non-overlapping windows -> poolable).
+        all_daily_ics: list[pd.Series] = []
         final_models: list[lgb.Booster] = []
 
         for fold_idx, (tr_dates, va_dates) in enumerate(splits):
@@ -1330,11 +1782,12 @@ class PredictionService:
             )
 
             va_scores = np.mean([m.predict(X_va) for m in models], axis=0)
-            _, fold_ic, fold_icir = self._compute_ic_metrics(
+            fold_ic_series, fold_ic, fold_icir = self._compute_ic_metrics(
                 va_df, va_scores, va_df["forward_return"].values,
             )
             fold_ics.append(fold_ic)
             fold_icirs.append(fold_icir)
+            all_daily_ics.append(fold_ic_series)
 
             if is_final_fold:
                 final_models = models
@@ -1370,7 +1823,12 @@ class PredictionService:
         except Exception:
             pass
 
-        quality_passed = (ic_mean > config.min_ic_threshold and icir > config.min_icir_threshold)
+        # Shared quality-gate helper (same logic as production _train_model)
+        # to prevent the two paths drifting. config is the per-market
+        # MarketConfig (may carry backtest overrides).
+        quality_passed, gate_metrics = self._evaluate_quality_gate(
+            fold_ics, fold_icirs, all_daily_ics, config,
+        )
 
         return {
             "models": final_models,
@@ -1383,6 +1841,10 @@ class PredictionService:
             "best_iters": best_iters,
             "feature_importance": feature_importance,
             "quality_passed": quality_passed,
+            "pooled_icir": gate_metrics["pooled_icir"],
+            "t_stat": gate_metrics["t_stat"],
+            "n_validation_dates": gate_metrics["n_validation_dates"],
+            "min_fold_ic": gate_metrics["min_fold_ic"],
             "ensemble_size": ensemble_size,
             "symbol_count": df["symbol"].nunique(),
             "feature_count": len(feature_cols),
@@ -1485,12 +1947,146 @@ class PredictionService:
         return ic_per_date, ic_mean, icir
 
     @staticmethod
+    def _evaluate_quality_gate(
+        fold_ics: list[float],
+        fold_icirs: list[float],
+        all_daily_ics: list["pd.Series"],
+        cfg: MarketConfig,
+    ) -> tuple[bool, dict[str, Any]]:
+        """Evaluate both the legacy and the significance quality gates.
+
+        Shared by the production trainer (``_train_model``) and the backtest
+        trainer (``train_for_backtest``) so the two paths cannot drift.
+
+        Returns ``(passed, metrics)`` where ``passed`` is the *binding*
+        approved/rejected decision: it honours
+        ``QUALITY_GATE_ENFORCE_SIGNIFICANCE`` (config). When that flag is false
+        (default = SHADOW mode) the binding decision is the LEGACY gate
+        (``ic_mean > min_ic AND icir > min_icir``); the significance gate is
+        still computed and returned in ``metrics`` (and logged by the caller)
+        for calibration. When the flag is true the binding decision is the
+        SIGNIFICANCE gate.
+
+        Pooling validity: walk-forward validation windows produced by
+        ``_walk_forward_splits`` are NON-OVERLAPPING (each fold's val_dates is a
+        disjoint ``unique_dates[val_start_idx:val_end_idx]`` slice with no shared
+        dates), so concatenating their per-date IC series yields an unbiased
+        pooled distribution with N = sum of per-fold validation-date counts.
+        ``metrics`` keys:
+            ic_mean, icir (legacy = mean(fold_ics)/mean(fold_icirs)),
+            pooled_ic_mean, pooled_icir, t_stat, n_validation_dates,
+            min_fold_ic, daily_ics (list[float], per-date IC pooled across
+            folds -- persisted per decision 8), legacy_passed,
+            significance_passed, enforce_significance.
+        """
+        settings = get_settings()
+        enforce = settings.QUALITY_GATE_ENFORCE_SIGNIFICANCE
+
+        # --- Legacy gate (mean of per-fold IC / per-fold ICIR) ---
+        ic_mean = float(np.mean(fold_ics)) if fold_ics else 0.0
+        icir = float(np.mean(fold_icirs)) if fold_icirs else 0.0
+        min_ic = cfg.min_ic_threshold
+        min_icir = cfg.min_icir_threshold
+        legacy_passed = bool(ic_mean > min_ic and icir > min_icir)
+
+        # --- Significance gate (pooled IC + per-fold lower bound + N + t) ---
+        # Pool the per-date IC series across all folds. The windows are
+        # non-overlapping (see docstring), so this is a clean concatenation.
+        valid_series = [s for s in all_daily_ics if s is not None and len(s) > 0]
+        if valid_series:
+            pooled = pd.concat(valid_series)
+            pooled = pooled.dropna()
+        else:
+            pooled = pd.Series(dtype=float)
+
+        n_validation_dates = int(len(pooled))
+        if n_validation_dates > 0:
+            pooled_ic_mean = float(pooled.mean())
+        else:
+            pooled_ic_mean = 0.0
+        # Population-corrected std (ddof=1) for the t-statistic.
+        if n_validation_dates >= 2:
+            pooled_std = float(pooled.std(ddof=1))
+        else:
+            pooled_std = 0.0
+        if pooled_std > 1e-10:
+            pooled_icir = pooled_ic_mean / pooled_std
+            t_stat = pooled_icir * math.sqrt(n_validation_dates)
+        else:
+            pooled_icir = 0.0
+            t_stat = 0.0
+
+        min_fold_ic = float(min(fold_ics)) if fold_ics else 0.0
+        folds_all_positive = (not cfg.require_all_folds_positive) or (min_fold_ic > 0)
+
+        significance_passed = bool(
+            pooled_ic_mean > min_ic
+            and folds_all_positive
+            and n_validation_dates >= cfg.min_validation_days
+            and t_stat >= cfg.min_t_stat
+        )
+
+        passed = significance_passed if enforce else legacy_passed
+
+        metrics: dict[str, Any] = {
+            "ic_mean": ic_mean,
+            "icir": icir,
+            "pooled_ic_mean": pooled_ic_mean,
+            "pooled_icir": pooled_icir,
+            "t_stat": t_stat,
+            "n_validation_dates": n_validation_dates,
+            "min_fold_ic": min_fold_ic,
+            # Per-date IC pooled across folds (decision 8: persist the series).
+            "daily_ics": [round(float(v), 6) for v in pooled.tolist()],
+            "legacy_passed": legacy_passed,
+            "significance_passed": significance_passed,
+            "enforce_significance": bool(enforce),
+        }
+        return passed, metrics
+
+    @staticmethod
+    def _log_significance_shadow(
+        market: str,
+        forward_days: int,
+        fold_ics: list[float],
+        metrics: dict[str, Any],
+        cfg: MarketConfig,
+    ) -> None:
+        """Emit a structured log of what the NEW significance gate would decide.
+
+        Used in shadow mode (and harmless when enforcing). Reports the verdict,
+        t-statistic, N, and -- when a fold is negative -- which fold(s) failed
+        the per-fold-positive requirement, so the gate can be calibrated.
+        """
+        negative_folds = [i for i, v in enumerate(fold_ics) if v <= 0]
+        logger.info(
+            "[significance-gate %s] market=%s fwd=%d would_decide=%s "
+            "t_stat=%.3f (min=%.2f) pooled_ic=%.4f (min=%.4f) pooled_icir=%.4f "
+            "N=%d (min=%d) min_fold_ic=%.4f negative_folds=%s",
+            "ENFORCED" if metrics.get("enforce_significance") else "SHADOW",
+            market,
+            forward_days,
+            "PASS" if metrics.get("significance_passed") else "FAIL",
+            metrics.get("t_stat", 0.0),
+            cfg.min_t_stat,
+            metrics.get("pooled_ic_mean", 0.0),
+            cfg.min_ic_threshold,
+            metrics.get("pooled_icir", 0.0),
+            metrics.get("n_validation_dates", 0),
+            cfg.min_validation_days,
+            metrics.get("min_fold_ic", 0.0),
+            negative_folds if negative_folds else "none",
+        )
+
+    @staticmethod
     def _save_model(
         models: list[lgb.Booster] | lgb.Booster,
         market: str,
         model_date: date,
         feature_cols: list[str],
         feature_importance: dict[str, float] | None = None,
+        model_type: str = "ranking",
+        forward_days: int = 5,
     ) -> str:
         if isinstance(models, lgb.Booster):
             models = [models]
@@ -1514,6 +2110,12 @@ class PredictionService:
         features_path = str(model_dir / "features.json")
         with open(features_path, "w") as f:
             json.dump(features_meta, f, default=_numpy_default)
+
+        # Quality marker defaults to "pending"; the gate rewrites it to
+        # approved/rejected after evaluation. Written here so the marker
+        # exists even if the gate-write step is interrupted (DB fallback
+        # covers absent markers regardless).
+        _write_quality_marker(str(model_dir), model_type, forward_days, "pending")
 
         return model_path
 
@@ -1645,9 +2247,15 @@ class PredictionService:
         model_path: Optional[str],
         forward_days: int,
         prediction_date: date,
+        serving_quality: Optional[str] = None,
     ) -> int:
         if model_path is None or not os.path.exists(model_path):
-            model_path = self._find_latest_model_on_disk(market, forward_days)
+            # Generic fallback path (e.g. existing-model-on-disk reuse): pick
+            # the latest approved model. The serving policy in
+            # _run_prediction_async resolves fallbacks before calling this.
+            model_path = await self._find_latest_model_on_disk(
+                market, forward_days, model_type="ranking",
+            )
 
         if model_path is None or not os.path.exists(model_path):
             raise RuntimeError(f"No model file found for market={market}")
@@ -1768,10 +2376,14 @@ class PredictionService:
         task.progress = 92.0
         await self._write_predictions(market, prediction_date, model_id, results_df, forward_days)
 
-        # Cache in Redis
+        # Cache in Redis. The cache carries the serving model's quality so a
+        # low-confidence (rejected-model) run never masquerades as a
+        # high-confidence cache hit and vice versa (decision 4/1#5).
         task.message = "Caching predictions"
         task.progress = 96.0
-        await self._write_prediction_cache(market, results_df, prediction_date)
+        await self._write_prediction_cache(
+            market, results_df, prediction_date, serving_quality=serving_quality,
+        )
 
         return len(results_df)
 
@@ -1943,11 +2555,16 @@ class PredictionService:
             return None
 
     async def _write_prediction_cache(
-        self, market: str, results_df: pd.DataFrame, prediction_date: date,
+        self,
+        market: str,
+        results_df: pd.DataFrame,
+        prediction_date: date,
+        serving_quality: Optional[str] = None,
     ) -> None:
         if results_df.empty:
             return
         key = _prediction_cache_key(market)
+        low_confidence = serving_quality == "rejected"
         try:
             records = []
             for _, row in results_df.iterrows():
@@ -1957,6 +2574,8 @@ class PredictionService:
                     "percentile_rank": float(row["percentile_rank"]),
                     "predicted_direction": row["predicted_direction"],
                     "prediction_date": prediction_date.isoformat(),
+                    "quality": serving_quality,
+                    "low_confidence": low_confidence,
                 })
 
             packed = msgpack.packb(records, use_bin_type=True)
@@ -1986,6 +2605,106 @@ class PredictionService:
     # ------------------------------------------------------------------
     # Data freshness check
     # ------------------------------------------------------------------
+
+    def _calendar_path(self, market: str) -> Optional[str]:
+        """Return the qlib day.txt calendar path for a market (or None).
+
+        Shared by the freshness check and the trading-day guard so the two
+        agree on the same calendar source.
+        """
+        settings = get_settings()
+        market_map = {"cn": "cn_data", "us": "us_data", "hk": "hk_data"}
+        qlib_market = market_map.get(market.lower())
+        if not qlib_market:
+            return None
+        return os.path.join(
+            settings.QLIB_DATA_DIR, qlib_market, "calendars", "day.txt"
+        )
+
+    def _load_trading_days(self, market: str) -> Optional[list[date]]:
+        """Load the sorted list of trading days from the qlib calendar.
+
+        Returns None when the calendar is missing / empty / unparseable so
+        callers can fail-OPEN. Parse errors on individual lines are skipped
+        rather than aborting the whole list (robustness over strictness).
+        """
+        calendar_path = self._calendar_path(market)
+        if not calendar_path or not os.path.exists(calendar_path):
+            return None
+        try:
+            with open(calendar_path) as f:
+                lines = f.read().strip().splitlines()
+        except Exception as e:
+            logger.warning("Failed to read calendar for %s: %s", market, e)
+            return None
+        days: list[date] = []
+        for ln in lines:
+            s = ln.strip()
+            if not s:
+                continue
+            try:
+                days.append(date.fromisoformat(s))
+            except ValueError:
+                continue
+        if not days:
+            return None
+        days.sort()
+        return days
+
+    def _is_trading_day(self, market: str, day: date) -> bool:
+        """Return True if ``day`` is a trading day for ``market``.
+
+        Reads the same qlib ``day.txt`` calendar as the freshness check.
+        Fail-OPEN: if the calendar is missing / empty / unparseable, return
+        True so a calendar outage never blocks predictions entirely.
+        """
+        days = self._load_trading_days(market)
+        if days is None:
+            logger.warning(
+                "Trading-day calendar unavailable for %s -- failing open "
+                "(treating %s as a trading day)", market, day.isoformat(),
+            )
+            return True
+        # Binary membership check against the sorted calendar.
+        idx = bisect.bisect_left(days, day)
+        return idx < len(days) and days[idx] == day
+
+    def _resolve_prediction_date(self, market: str, today: date) -> date:
+        """Align the prediction date to the actual data day used at inference.
+
+        Returns the latest trading day on-or-before ``today`` from the qlib
+        calendar so that every written ``stock_predictions`` row carries a
+        backfillable trading-day date (decision 10: prevent NEW non-trading
+        rows). Fail-OPEN to ``today`` when the calendar is unavailable -- this
+        preserves legacy behavior rather than blocking predictions.
+
+        ``write_predictions`` upserts on ``(market, symbol, prediction_date,
+        forward_days)`` so re-aligning the date is idempotent and safe.
+        """
+        days = self._load_trading_days(market)
+        if days is None:
+            logger.warning(
+                "Trading-day calendar unavailable for %s -- using today=%s "
+                "as prediction_date (fail-open)", market, today.isoformat(),
+            )
+            return today
+        # Largest calendar day that is <= today.
+        idx = bisect.bisect_right(days, today)
+        if idx == 0:
+            # Every calendar day is after today (clock skew / stale data) --
+            # fail-open to today rather than inventing a future date.
+            logger.warning(
+                "No trading day on-or-before %s for %s -- using today "
+                "(fail-open)", today.isoformat(), market,
+            )
+            return today
+        aligned = days[idx - 1]
+        if aligned != today:
+            logger.info(
+                "Aligned prediction_date for %s: %s -> %s (latest trading day)",
+                market, today.isoformat(), aligned.isoformat(),
+            )
+        return aligned
 
     def _check_data_freshness(self, market: str) -> tuple[bool, str]:
         settings = get_settings()

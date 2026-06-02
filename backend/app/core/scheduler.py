@@ -34,6 +34,18 @@ _LEADER_TTL = 60       # seconds -- key expires if leader crashes
 _HEARTBEAT_INTERVAL = 20  # seconds -- renew well before TTL expires
 _SUPERVISOR_INTERVAL = 30  # seconds -- re-elect cadence when not leader
 
+# Per-job last-success tracking (Batch D / decision 9). Each successful job
+# run writes an ISO-8601 UTC timestamp to af:scheduler:last_success:{job_id}
+# so the admin scheduler surface can show how long ago each job last
+# succeeded. Key has no TTL -- it always reflects the most recent success.
+_LAST_SUCCESS_KEY_PREFIX = "af:scheduler:last_success:"
+
+# Markets that participate in ML prediction / backfill / SLA monitoring.
+# `metal` is synced to Qlib but has no prediction model, so it is excluded
+# from chained backfill and SLA checks.
+_BACKFILL_MARKETS = ("us", "hk", "cn")
+_SLA_MARKETS = ("us", "hk", "cn")
+
 # Unique ID for this worker instance
 _INSTANCE_ID = str(uuid.uuid4())
 
@@ -229,6 +241,11 @@ def _build_scheduler() -> None:
         id="check_auto_retrain", name="Check auto-retrain",
         **_job_kwargs,
     )
+    _scheduler.add_job(
+        _run_sla_check, CronTrigger(hour=4, minute=0),
+        id="sla_check", name="Freshness SLA check",
+        **_job_kwargs,
+    )
 
     _scheduler.start()
     logger.info("Scheduler started with %d jobs", len(_scheduler.get_jobs()))
@@ -344,6 +361,34 @@ async def _release_leadership() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Job last-success tracking (Batch D)
+# ---------------------------------------------------------------------------
+
+
+def last_success_key(job_id: str) -> str:
+    """Return the Redis key holding the last-success timestamp for a job."""
+    return f"{_LAST_SUCCESS_KEY_PREFIX}{job_id}"
+
+
+async def _record_job_success(job_id: str) -> None:
+    """Record a successful job completion as an ISO-8601 UTC timestamp.
+
+    Best-effort: a Redis blip must never turn a successful job into a
+    failure, so all errors are swallowed with a warning.
+    """
+    try:
+        from datetime import timezone
+
+        r = await get_redis()
+        ts = datetime.now(timezone.utc).isoformat()
+        await r.set(last_success_key(job_id), ts)
+    except Exception as exc:
+        logger.warning(
+            "Scheduler: failed to record last-success for %s: %s", job_id, exc,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Job handlers
 # ---------------------------------------------------------------------------
 
@@ -374,8 +419,33 @@ async def _run_qlib_sync(market: str) -> None:
             result.get("symbol_count", 0),
             result.get("duration_s", 0),
         )
+        await _record_job_success(f"qlib_sync_{market}")
     except Exception:
         logger.exception("Scheduler: Qlib sync for %s failed", market)
+        return
+
+    # Chained per-market backfill (Batch D): the freshest bar for `market`
+    # was just synced, so backfill that market's pending actual returns
+    # immediately rather than waiting up to ~24h for the daily fallback job.
+    # Wrapped so a backfill failure never masks the successful sync above;
+    # the daily all-market _run_backfill_returns remains the safety net.
+    # Only fired for prediction markets -- backfill_returns has no notion of
+    # `metal`, and passing an unsupported market would fall back to an
+    # unwanted full all-market backfill.
+    if market in _BACKFILL_MARKETS:
+        try:
+            from app.services.prediction_service import prediction_service
+
+            bf = await prediction_service.backfill_returns(markets=(market,))
+            logger.info(
+                "Scheduler: chained backfill for %s -- updated=%s, total=%s",
+                market, bf.get("updated", 0), bf.get("total", 0),
+            )
+        except Exception:
+            logger.exception(
+                "Scheduler: chained backfill for %s failed (non-fatal, daily "
+                "fallback will retry)", market,
+            )
 
 
 async def _run_prediction(market: str) -> None:
@@ -437,6 +507,12 @@ async def _run_prediction(market: str) -> None:
                 "Scheduler: prediction %s task %s finished (status=%s)",
                 market, task_id, task_obj.status if task_obj else "unknown",
             )
+
+        # Record success only when the task did not end in failure. A skipped
+        # (non-trading-day / stale-data) run still counts as a successful job
+        # execution -- the scheduler did its job; the skip is intentional.
+        if task_obj is None or task_obj.status != "failed":
+            await _record_job_success(f"predict_{market}")
     except Exception:
         logger.exception("Scheduler: prediction for %s failed", market)
 
@@ -449,12 +525,15 @@ async def _run_backfill_returns() -> None:
     try:
         from app.services.prediction_service import prediction_service
 
+        # No markets arg -> all-market fallback (safety net for the chained
+        # per-market backfills that run after each qlib sync).
         result = await prediction_service.backfill_returns()
         logger.info(
             "Scheduler: backfill returns complete -- updated=%s, failed=%s",
             result.get("updated", 0),
             result.get("failed", 0),
         )
+        await _record_job_success("backfill_returns")
     except Exception:
         logger.exception("Scheduler: backfill returns failed")
 
@@ -474,6 +553,7 @@ async def _run_cleanup_models() -> None:
             result.get("kept", 0),
             result.get("errors", 0),
         )
+        await _record_job_success("cleanup_models")
     except Exception:
         logger.exception("Scheduler: model cleanup failed")
 
@@ -537,5 +617,65 @@ async def _run_check_auto_retrain() -> None:
                     "Scheduler: invalid model_date format for %s: %s",
                     market, model_date_str,
                 )
+        await _record_job_success("check_auto_retrain")
     except Exception:
         logger.exception("Scheduler: auto-retrain check failed")
+
+
+# Redis key holding the most recent SLA check result (JSON), read by the
+# admin scheduler surface. No TTL -- always the latest computed snapshot.
+_SLA_STATUS_KEY = "af:scheduler:sla"
+
+
+async def _run_sla_check() -> None:
+    """Daily freshness SLA check (Batch D / decision 9).
+
+    Compares each prediction market's freshest model + prediction dates
+    against per-market SLA windows (MarketConfig). On breach it emits a
+    structured WARNING log (decision 9 = no external notification) and
+    persists the full status to Redis so ``/admin/scheduler/jobs`` can
+    surface it (SchedulerStatus.sla).
+    """
+    if not _is_leader:
+        return
+    logger.info("Scheduler: starting SLA check")
+    try:
+        import json
+
+        from app.services.prediction_service import prediction_service
+
+        status = await prediction_service.compute_sla_status(_SLA_MARKETS)
+
+        # Structured WARNING per breaching market (decision 9).
+        for entry in status.get("markets", []):
+            if entry.get("model_age_breach") or entry.get("prediction_lag_breach"):
+                logger.warning(
+                    "SLA BREACH market=%s model_age_days=%s "
+                    "(max=%s, breach=%s) prediction_lag_days=%s "
+                    "(max=%s, breach=%s) latest_model_date=%s "
+                    "latest_prediction_date=%s",
+                    entry.get("market"),
+                    entry.get("model_age_days"),
+                    entry.get("max_model_age_days"),
+                    entry.get("model_age_breach"),
+                    entry.get("prediction_lag_days"),
+                    entry.get("max_prediction_lag_days"),
+                    entry.get("prediction_lag_breach"),
+                    entry.get("latest_model_date"),
+                    entry.get("latest_prediction_date"),
+                )
+
+        # Persist for the admin surface (best-effort).
+        try:
+            r = await get_redis()
+            await r.set(_SLA_STATUS_KEY, json.dumps(status))
+        except Exception as exc:
+            logger.warning("Scheduler: failed to persist SLA status: %s", exc)
+
+        logger.info(
+            "Scheduler: SLA check complete -- breach=%s",
+            status.get("breach"),
+        )
+        await _record_job_success("sla_check")
+    except Exception:
+        logger.exception("Scheduler: SLA check failed")

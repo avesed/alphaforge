@@ -135,6 +135,8 @@ async def _direction_pipeline(
     prediction_date: Optional[date] = None,
 ) -> dict:
     """Internal direction pipeline -- may raise on failure."""
+    settings = get_settings()
+    binding = settings.QUALITY_GATE_BINDING
     cfg = get_market_config(market)
     today = prediction_date or date.today()
 
@@ -148,6 +150,7 @@ async def _direction_pipeline(
     direction_model_path = os.path.join(model_dir, "direction_model.pkl")
 
     trained_this_run = False
+    # quality_passed reflects today's candidate model (or reused on-disk one).
     quality_passed = True
     auc_score = 0.0
     brier = 0.0
@@ -157,6 +160,14 @@ async def _direction_pipeline(
             "Existing direction model found at %s, skipping training",
             direction_model_path,
         )
+        if binding:
+            # Resolve the reused model's quality so a rejected on-disk model
+            # is subject to the serving policy below.
+            existing_quality = await prediction_store.get_model_quality(
+                market, today, forward_days, "direction",
+            )
+            if existing_quality == "rejected":
+                quality_passed = False
     else:
         # Step 2: Train the direction model
         train_result = await _train_direction_model(
@@ -175,15 +186,51 @@ async def _direction_pipeline(
                 brier, cfg.direction_max_brier,
             )
 
-    # Step 3: Inference
+    # Step 3: Decide which model serves (decision 5).
+    #   - gate passed (or binding off): use today's model, normal confidence.
+    #   - rejected + binding + prior approved exists: serve prior approved.
+    #   - rejected + binding + no approved ever: serve today tagged low_conf.
+    serving_quality = "approved"
+    use_approved_only = False
+    exclude_today: Optional[date] = None
+
+    if binding and not quality_passed:
+        approved = await prediction_store.get_latest_approved_model(
+            market, model_type="direction", forward_days=forward_days,
+            before_date=today,
+        )
+        if approved is not None:
+            # Load the prior approved direction model (never today's rejected).
+            use_approved_only = True
+            exclude_today = today
+            serving_quality = "approved"
+            logger.warning(
+                "Direction gate failed for %s/%s -- serving prior approved "
+                "direction model (date=%s)",
+                market, today.isoformat(), approved.get("model_date"),
+            )
+        else:
+            # No approved direction model ever -> serve today tagged low_conf.
+            serving_quality = "rejected"
+            logger.warning(
+                "Direction gate failed for %s/%s and no prior approved model "
+                "-- serving today's rejected direction model (low_confidence)",
+                market, today.isoformat(),
+            )
+
+    # Step 4: Inference using the resolved serving model.
     n_updated = await _run_direction_inference(
         market, today, forward_days, cfg,
+        approved_only=use_approved_only,
+        exclude_date=exclude_today,
     )
 
     summary = {
         "market": market,
         "trained": trained_this_run,
         "quality_passed": quality_passed,
+        "serving_quality": serving_quality,
+        "low_confidence": serving_quality == "rejected",
         "auc": auc_score if trained_this_run else None,
         "brier_score": brier if trained_this_run else None,
         "predictions_updated": n_updated,
@@ -191,8 +238,8 @@ async def _direction_pipeline(
 
     logger.info(
         "Direction model pipeline completed: market=%s, trained=%s, "
-        "quality_passed=%s, predictions_updated=%d",
-        market, trained_this_run, quality_passed, n_updated,
+        "quality_passed=%s, serving_quality=%s, predictions_updated=%d",
+        market, trained_this_run, quality_passed, serving_quality, n_updated,
     )
 
     return summary
@@ -417,7 +464,18 @@ async def _train_direction_model(
     model_id = None
 
     if persist:
-        _save_direction_model(final_models, calibrator, feature_cols, model_dir)
+        from app.services.prediction_service import _write_quality_marker
+
+        _save_direction_model(
+            final_models, calibrator, feature_cols, model_dir,
+            forward_days=forward_days,
+        )
+
+        # Rewrite the marker now that the gate has decided (DB authoritative).
+        _write_quality_marker(
+            model_dir, "direction", forward_days,
+            "approved" if quality_passed else "rejected",
+        )
 
         model_id = await _record_direction_model(
             market=market,
@@ -474,14 +532,26 @@ async def _run_direction_inference(
     prediction_date: date,
     forward_days: int,
     cfg: MarketConfig,
+    approved_only: bool = False,
+    exclude_date: Optional[date] = None,
 ) -> int:
-    """Run direction model inference and update up_probability via StockPulse."""
+    """Run direction model inference and update up_probability via StockPulse.
+
+    When ``approved_only`` is set (serving policy fallback after a rejected
+    gate), the model loader skips non-approved and ``exclude_date`` models so
+    a just-rejected model is never served over a prior approved one
+    (decision 5).
+    """
     model_dir, models, calibrator, feature_cols = await _load_direction_model(
-        market, prediction_date,
+        market, prediction_date, forward_days=forward_days,
+        approved_only=approved_only, exclude_date=exclude_date,
     )
 
     if models is None:
-        logger.warning("No direction model found for market=%s", market)
+        logger.warning(
+            "No direction model found for market=%s (approved_only=%s)",
+            market, approved_only,
+        )
         return 0
 
     logger.info(
@@ -741,7 +811,10 @@ def _save_direction_model(
     calibrator: Any,
     feature_cols: list[str],
     model_dir: str,
+    forward_days: int = 5,
 ) -> None:
+    from app.services.prediction_service import _write_quality_marker
+
     model_path = os.path.join(model_dir, "direction_model.pkl")
     joblib.dump(models, model_path)
 
@@ -757,22 +830,58 @@ def _save_direction_model(
     with open(features_path, "w") as f:
         json.dump(features_meta, f, default=_numpy_default)
 
+    # Quality marker defaults to "pending"; rewritten after the gate. The
+    # direction marker (quality.direction.{fwd}.json) is independent of the
+    # ranking marker and never overwrites it.
+    _write_quality_marker(model_dir, "direction", forward_days, "pending")
+
 
 async def _load_direction_model(
     market: str,
     target_date: date,
+    forward_days: int = 5,
+    approved_only: bool = False,
+    exclude_date: Optional[date] = None,
 ) -> tuple[Optional[str], Optional[list[lgb.Booster]], Any, list[str]]:
+    """Load a direction model, scanning back up to 31 days.
+
+    When ``approved_only`` is True (Batch A serving policy), only approved
+    models are loaded: quality is read from the on-disk marker first, then
+    the DB (decision 3) for marker-less legacy directories. ``exclude_date``
+    skips a specific model date (e.g. today's just-rejected model).
+    """
+    from app.services.prediction_service import _read_quality_marker
+
     settings = get_settings()
     base_dir = Path(settings.PREDICTION_DATA_DIR) / market
+    exclude_str = exclude_date.strftime("%Y%m%d") if exclude_date is not None else None
 
     for days_back in range(31):
         check_date = target_date - timedelta(days=days_back)
         date_str = check_date.strftime("%Y%m%d")
+        if exclude_str is not None and date_str == exclude_str:
+            continue
         model_dir = str(base_dir / date_str)
         model_path = os.path.join(model_dir, "direction_model.pkl")
 
         if not os.path.exists(model_path):
             continue
+
+        if approved_only:
+            quality = _read_quality_marker(model_dir, "direction", forward_days)
+            if quality not in ("approved", "rejected"):
+                try:
+                    quality = await prediction_store.get_model_quality(
+                        market, check_date, forward_days, "direction",
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "DB direction quality lookup failed for %s/%s: %s",
+                        market, date_str, e,
+                    )
+                    quality = None
+            if quality != "approved":
+                continue
 
         try:
             loaded = await asyncio.to_thread(joblib.load, model_path)

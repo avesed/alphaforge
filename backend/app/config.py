@@ -70,6 +70,24 @@ class Settings(BaseSettings):
     MODEL_RETENTION_DAYS: int = 90
     MODEL_MIN_QUALITY_KEEP: int = 3
 
+    # Quality-gate binding (Batch A). When true, a rejected model is never
+    # served: the serving path prefers the latest prior approved model, and
+    # only serves today's rejected model (tagged low_confidence) when no
+    # approved model has ever existed for that market. Set false to revert to
+    # the legacy behavior of serving the latest model on disk regardless of
+    # quality.
+    QUALITY_GATE_BINDING: bool = True
+
+    # Significance quality gate (Batch C). When false (default = SHADOW mode),
+    # the actual approved/rejected decision still uses the legacy gate
+    # (ic_mean > min_ic AND icir > min_icir); the new significance gate
+    # (pooled IC + per-fold lower bound + N validation days + t-statistic) is
+    # only computed and logged for calibration ("what the new gate WOULD
+    # decide"). Flip to true to ENFORCE the significance gate as the binding
+    # approved/rejected decision -- only after the true per-fold N has been
+    # calibrated from real retraining runs.
+    QUALITY_GATE_ENFORCE_SIGNIFICANCE: bool = False
+
     # RD-Agent
     RDAGENT_CHAT_MODEL: str = "gpt-4o-mini"
     RDAGENT_EMBED_MODEL: str = "text-embedding-3-small"
