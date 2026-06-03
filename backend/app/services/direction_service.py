@@ -53,6 +53,29 @@ _TRAIN_LOOKBACK_DAYS = 730
 _MIN_TRAIN_DATES = 60
 _MIN_SYMBOLS_PER_DATE = 25
 
+
+def _direction_model_filename(forward_days: int) -> str:
+    """Per-horizon direction model artifact filename.
+
+    5d keeps the legacy ``direction_model.pkl`` so existing single-horizon
+    directories remain valid; other horizons use ``direction_model.{fwd}d.pkl``.
+    """
+    return (
+        "direction_model.pkl" if forward_days == 5
+        else f"direction_model.{forward_days}d.pkl"
+    )
+
+
+def _direction_calibrator_filename(forward_days: int) -> str:
+    return "calibrator.pkl" if forward_days == 5 else f"calibrator.{forward_days}d.pkl"
+
+
+def _direction_features_filename(forward_days: int) -> str:
+    return (
+        "direction_features.json" if forward_days == 5
+        else f"direction_features.{forward_days}d.json"
+    )
+
 _ENSEMBLE_SEEDS: list[int] = [42, 137, 271, 419, 503, 631, 769, 887, 953, 1031]
 
 _DIRECTION_LGB_PARAMS: dict[str, Any] = {
@@ -145,9 +168,11 @@ async def _direction_pipeline(
         market, forward_days,
     )
 
-    # Step 1: Check for existing direction model
+    # Step 1: Check for existing direction model (per-horizon artifact)
     model_dir = _get_model_dir(market, today)
-    direction_model_path = os.path.join(model_dir, "direction_model.pkl")
+    direction_model_path = os.path.join(
+        model_dir, _direction_model_filename(forward_days),
+    )
 
     trained_this_run = False
     # quality_passed reflects today's candidate model (or reused on-disk one).
@@ -489,7 +514,9 @@ async def _train_direction_model(
             symbol_count=final_val_df["symbol"].nunique(),
             auc=mean_auc,
             brier_score=mean_brier,
-            model_path=os.path.join(model_dir, "direction_model.pkl"),
+            model_path=os.path.join(
+                model_dir, _direction_model_filename(forward_days),
+            ),
             quality_passed=quality_passed,
             extra_metadata={
                 "ensemble_size": ensemble_size,
@@ -815,10 +842,12 @@ def _save_direction_model(
 ) -> None:
     from app.services.prediction_service import _write_quality_marker
 
-    model_path = os.path.join(model_dir, "direction_model.pkl")
+    model_path = os.path.join(model_dir, _direction_model_filename(forward_days))
     joblib.dump(models, model_path)
 
-    calibrator_path = os.path.join(model_dir, "calibrator.pkl")
+    calibrator_path = os.path.join(
+        model_dir, _direction_calibrator_filename(forward_days),
+    )
     joblib.dump(calibrator, calibrator_path)
 
     features_meta = {
@@ -826,7 +855,9 @@ def _save_direction_model(
         "count": len(feature_cols),
         "ensemble_size": len(models),
     }
-    features_path = os.path.join(model_dir, "direction_features.json")
+    features_path = os.path.join(
+        model_dir, _direction_features_filename(forward_days),
+    )
     with open(features_path, "w") as f:
         json.dump(features_meta, f, default=_numpy_default)
 
@@ -862,7 +893,9 @@ async def _load_direction_model(
         if exclude_str is not None and date_str == exclude_str:
             continue
         model_dir = str(base_dir / date_str)
-        model_path = os.path.join(model_dir, "direction_model.pkl")
+        model_path = os.path.join(
+            model_dir, _direction_model_filename(forward_days),
+        )
 
         if not os.path.exists(model_path):
             continue
@@ -887,12 +920,16 @@ async def _load_direction_model(
             loaded = await asyncio.to_thread(joblib.load, model_path)
             models = loaded if isinstance(loaded, list) else [loaded]
 
-            calibrator_path = os.path.join(model_dir, "calibrator.pkl")
+            calibrator_path = os.path.join(
+                model_dir, _direction_calibrator_filename(forward_days),
+            )
             calibrator = None
             if os.path.exists(calibrator_path):
                 calibrator = await asyncio.to_thread(joblib.load, calibrator_path)
 
-            features_path = os.path.join(model_dir, "direction_features.json")
+            features_path = os.path.join(
+                model_dir, _direction_features_filename(forward_days),
+            )
             feature_cols: list[str] = []
             if os.path.exists(features_path):
                 def _read():

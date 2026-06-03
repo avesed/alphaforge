@@ -58,6 +58,25 @@ class MarketConfig:
         CN=90: quarterly reporting cycle ~90 days.
         US/HK=45: more frequent data updates.
 
+    Universe filtering
+    ------------------
+    excluded_symbols : frozenset[str]
+        UPPERCASE tickers to remove from the resolved prediction universe.
+        Applied on EVERY return path of ``_resolve_symbols`` (including the
+        stored-universe early return, which can be ETF-polluted from a prior
+        auto-save) and BEFORE top-N-by-dollar-volume selection so ETF slots
+        are not wasted.
+
+        Maintained as a hand-curated blocklist because StockPulse's
+        ``stock_type`` metadata is unpopulated, so we cannot filter ETFs/funds
+        by instrument type at the data layer.
+
+        US is populated with a broad ETF/fund blocklist. ETFs receive extreme
+        cross-sectional ranks (bond/index/sector funds especially) that invert
+        ranking IC -- removing 33 ETFs from the US universe lifted ranking IC
+        0.0083 -> 0.0210 (+153%) and fixed recent-regime fold collapse. CN/HK
+        keep the empty default (their universes are stock-only in practice).
+
     Quality gate
     ------------
     min_ic_threshold : float
@@ -135,6 +154,8 @@ class MarketConfig:
     use_interactions: bool
     nan_threshold: float
     ffill_limit: int
+    # Universe filtering (hand-curated; StockPulse stock_type is unpopulated)
+    excluded_symbols: frozenset[str] = frozenset()
     # Market-level features
     index_symbol: str = "^GSPC"
     # Quality gate (per-market overrides for global PREDICTION_MIN_IC/ICIR)
@@ -168,6 +189,39 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
         use_interactions=True,
         nan_threshold=0.75,
         ffill_limit=45,
+        # Maintained US ETF/fund blocklist (UPPERCASE). StockPulse stock_type
+        # is unpopulated, so type-based filtering at the data layer is not
+        # available -- this list is curated by hand. Removing ETFs lifted
+        # ranking IC 0.0083 -> 0.0210 (+153%). Covers broad index, sector
+        # SPDRs, bond, intl, thematic, leveraged/inverse, and dividend funds.
+        excluded_symbols=frozenset({
+            # Broad index / total market
+            "SPY", "QQQ", "DIA", "IWM", "VOO", "VTI", "IVV",
+            "RSP", "SCHX", "SCHB", "ITOT", "SPLG", "QUAL", "MTUM",
+            "USMV", "VLUE",
+            # Size / style
+            "IJR", "IJH", "MDY",
+            # Volatility / leveraged / inverse
+            "VXX", "UVXY", "SVXY", "SQQQ", "TQQQ", "SPXL", "SPXS",
+            "SOXL",
+            # Commodity
+            "GLD", "SLV", "USO", "UNG",
+            # Bond / treasury / credit
+            "TLT", "IEF", "SHY", "SHV", "GOVT", "BIL", "AGG", "BND",
+            "LQD", "HYG", "JNK", "TIP", "EMB", "MUB", "VCIT", "VCSH",
+            # Sector SPDRs / industry
+            "XLF", "XLK", "XLE", "XLV", "XLY", "XLP", "XLI", "XLU",
+            "XLB", "XLRE", "XLC", "XBI", "XOP", "XME", "XRT",
+            "SMH", "SOXX", "IBB",
+            # Thematic / ARK
+            "ARKK", "ARKG", "ARKW", "ARKF",
+            # International / emerging / developed
+            "EEM", "EFA", "VEA", "VWO", "VEU", "IEMG", "IEFA",
+            # Real estate
+            "VNQ", "VNQI",
+            # Dividend
+            "SCHD", "VYM", "VIG", "DGRO", "DVY",
+        }),
         lgb_overrides={
             "learning_rate": 0.01,
             "num_leaves": 31,

@@ -8,6 +8,7 @@ Training pipeline:
 5. Purged time-series split (train/val) with gap = forward_days
 6. LightGBM training: objective='lambdarank', early_stopping_rounds=50
 7. joblib.dump() model -> /app/data/predictions/{market}/{YYYYMMDD}/model.pkl
+   (5d/legacy) or model.{forward_days}d.pkl for other horizons
 8. Evaluate IC/ICIR/NDCG -> write to prediction_models via StockPulse API
 
 Inference pipeline:
@@ -160,6 +161,21 @@ def _prediction_cache_key(market: str) -> str:
 # ---------------------------------------------------------------------------
 # Quality markers (on-disk hot-path cache for model quality; DB authoritative)
 # ---------------------------------------------------------------------------
+
+
+def _ranking_model_filename(forward_days: int) -> str:
+    """Per-horizon ranking model artifact filename within a date directory.
+
+    Multiple horizons (e.g. 5d + 20d) share the same ``{market}/{date}/``
+    directory, so the ranking artifact must be keyed on ``forward_days`` to
+    avoid one horizon's ``_save_model`` overwriting another's model.
+
+    The 5d horizon keeps the legacy ``model.pkl`` name so existing
+    single-horizon directories on disk (all written before multi-horizon was
+    enabled) and the DB ``file_path`` rows pointing at them remain valid.
+    Other horizons use ``model.{forward_days}d.pkl``.
+    """
+    return "model.pkl" if forward_days == 5 else f"model.{forward_days}d.pkl"
 
 
 def _quality_marker_name(model_type: str, forward_days: int) -> str:
@@ -377,7 +393,12 @@ class PredictionService:
         # _run_prediction_async). Fail-open to today if calendar unavailable.
         prediction_date = self._resolve_prediction_date(market, cal_today)
         try:
+            dir_results: dict[int, dict] = {}
             for i, h in enumerate(horizons):
+                # Reserve the last 10% of the bar for the direction step so each
+                # horizon trains BOTH the ranking model and its own direction
+                # model (keyed on forward_days, so artifacts never collide).
+                slice_size = 90.0 / n_horizons
                 pct_base = (i / n_horizons) * 90
                 task.message = f"Horizon {h}d ({i + 1}/{n_horizons})"
                 task.progress = pct_base
@@ -388,17 +409,21 @@ class PredictionService:
                 await self._run_prediction_async(
                     task, market, h, force_retrain,
                     _progress_base=pct_base,
-                    _progress_range=90.0 / n_horizons,
+                    _progress_range=slice_size * 0.85,
                     _skip_completion=True,
                 )
 
-            # Direction model (non-fatal)
-            task.message = "Training direction model"
-            task.progress = 95.0
-            dir_result = await self._run_direction_step(
-                task, market, force_retrain=force_retrain,
-                prediction_date=prediction_date,
-            )
+                # Per-horizon direction model (non-fatal). Each horizon gets its
+                # own up_probability on its own (market, date, forward_days)
+                # rows -- _update_up_probabilities filters by forward_days.
+                task.message = f"Direction model [{h}d] ({i + 1}/{n_horizons})"
+                task.progress = pct_base + slice_size * 0.9
+                dir_result = await self._run_direction_step(
+                    task, market, force_retrain=force_retrain,
+                    prediction_date=prediction_date, forward_days=h,
+                )
+                if dir_result:
+                    dir_results[h] = dir_result
 
             task.status = "completed"
             task.progress = 100.0
@@ -406,8 +431,12 @@ class PredictionService:
             task.message = f"Completed: {n_horizons} horizons"
             task.results = task.results or {}
             task.results["horizons"] = horizons
-            if dir_result:
-                task.results["direction_model"] = dir_result
+            if dir_results:
+                # Keep the default-horizon (5d) result under the legacy key for
+                # backward compatibility; expose all horizons under a map.
+                if 5 in dir_results:
+                    task.results["direction_model"] = dir_results[5]
+                task.results["direction_models"] = dir_results
 
         except Exception as e:
             logger.error(
@@ -466,16 +495,18 @@ class PredictionService:
         market: str,
         force_retrain: bool = False,
         prediction_date: Optional[date] = None,
+        forward_days: int = 5,
     ) -> Optional[dict]:
         try:
             from app.services.direction_service import train_and_predict_direction
 
             prev_msg = task.message
-            task.message = "Training direction model"
+            task.message = f"Training direction model [{forward_days}d]"
 
             result = await train_and_predict_direction(
                 market, force_retrain=force_retrain,
                 prediction_date=prediction_date,
+                forward_days=forward_days,
             )
 
             if result:
@@ -1006,6 +1037,47 @@ class PredictionService:
         1. Stored universe from system_settings (stable, admin-configured)
         2. Compute top-N by dollar volume from Qlib, auto-save to settings
         3. Market cap fallback via StockPulse
+
+        After resolution, ``MarketConfig.excluded_symbols`` (e.g. the US ETF
+        blocklist) is applied uniformly to EVERY return path -- including the
+        stored-universe early return, which may have been auto-saved before
+        the blocklist existed and is therefore ETF-polluted. When the blocklist
+        is empty (CN/HK) this is a no-op.
+        """
+        cfg = get_market_config(market)
+        excluded = cfg.excluded_symbols
+
+        def _filter(syms: list[str]) -> list[str]:
+            """Drop excluded tickers (case-insensitive). No-op if empty.
+
+            US tickers are plain (no suffix); CN/HK universe symbols may carry
+            suffixes (e.g. ``600000.SS``), but those markets have an empty
+            blocklist so the comparison never accidentally strips them.
+            """
+            if not excluded:
+                return syms
+            filtered = [s for s in syms if s.upper() not in excluded]
+            removed = len(syms) - len(filtered)
+            if removed:
+                logger.info(
+                    "Excluded %d blocklisted symbol(s) from %s universe "
+                    "(%d -> %d)",
+                    removed, market, len(syms), len(filtered),
+                )
+            return filtered
+
+        resolved = await self._resolve_symbols_raw(market, excluded=excluded)
+        return _filter(resolved)
+
+    async def _resolve_symbols_raw(
+        self, market: str, excluded: frozenset[str] = frozenset(),
+    ) -> list[str]:
+        """Resolve the raw universe (pre-blocklist) for ``_resolve_symbols``.
+
+        ``excluded`` is used here ONLY to prune the candidate pool BEFORE the
+        top-N-by-dollar-volume / market-cap selection, so blocklisted ETFs do
+        not consume universe slots. The caller still applies the final
+        blocklist filter to every return path (stored universe included).
         """
         settings = get_settings()
         max_size = settings.PREDICTION_UNIVERSE_SIZE
@@ -1031,6 +1103,12 @@ class PredictionService:
         except Exception as e:
             logger.error("Symbol fetch failed for market=%s: %s", market, e)
             return []
+
+        # Prune blocklisted ETFs from the candidate pool BEFORE top-N selection
+        # so the top-N (and the auto-saved stored universe) is computed on
+        # stocks only. No-op when the blocklist is empty (CN/HK).
+        if excluded:
+            all_symbols = [s for s in all_symbols if s.upper() not in excluded]
 
         if len(all_symbols) <= max_size:
             return all_symbols
@@ -1167,11 +1245,16 @@ class PredictionService:
     def _check_existing_model_on_disk(
         self, market: str, model_date: date, forward_days: int,
     ) -> Optional[str]:
-        """Check if a model already exists on disk for today."""
+        """Check if a model already exists on disk for today + this horizon.
+
+        Keyed on ``forward_days`` (via ``_ranking_model_filename``) so a
+        multi-horizon run does not reuse a different horizon's artifact.
+        """
         settings = get_settings()
         date_str = model_date.strftime("%Y%m%d")
         model_path = os.path.join(
-            settings.PREDICTION_DATA_DIR, market, date_str, "model.pkl"
+            settings.PREDICTION_DATA_DIR, market, date_str,
+            _ranking_model_filename(forward_days),
         )
         if os.path.exists(model_path):
             return model_path
@@ -1210,7 +1293,11 @@ class PredictionService:
         except OSError:
             return None
 
-        model_filename = "direction_model.pkl" if model_type == "direction" else "model.pkl"
+        if model_type == "direction":
+            from app.services.direction_service import _direction_model_filename
+            model_filename = _direction_model_filename(forward_days)
+        else:
+            model_filename = _ranking_model_filename(forward_days)
         exclude_str = exclude_date.strftime("%Y%m%d") if exclude_date is not None else None
 
         for dirname in date_dirs:
@@ -1251,10 +1338,11 @@ class PredictionService:
     def _find_latest_model_on_disk_legacy(
         self, market: str, forward_days: int,
     ) -> Optional[str]:
-        """Legacy (quality-blind) disk resolver -- newest model.pkl.
+        """Legacy (quality-blind) disk resolver -- newest ranking model.
 
         Used only when QUALITY_GATE_BINDING is disabled, to preserve the
-        original behavior as a one-flag revert path.
+        original behavior as a one-flag revert path. Keyed on ``forward_days``
+        so multi-horizon runs do not cross-serve a different horizon's model.
         """
         settings = get_settings()
         market_dir = os.path.join(settings.PREDICTION_DATA_DIR, market)
@@ -1264,8 +1352,9 @@ class PredictionService:
             date_dirs = sorted(os.listdir(market_dir), reverse=True)
         except OSError:
             return None
+        model_filename = _ranking_model_filename(forward_days)
         for dirname in date_dirs:
-            model_path = os.path.join(market_dir, dirname, "model.pkl")
+            model_path = os.path.join(market_dir, dirname, model_filename)
             if os.path.exists(model_path):
                 return model_path
         return None
@@ -2096,7 +2185,7 @@ class PredictionService:
         model_dir = Path(settings.PREDICTION_DATA_DIR) / market / date_str
         model_dir.mkdir(parents=True, exist_ok=True)
 
-        model_path = str(model_dir / "model.pkl")
+        model_path = str(model_dir / _ranking_model_filename(forward_days))
         joblib.dump(models, model_path)
 
         features_meta: dict[str, Any] = {
