@@ -64,9 +64,10 @@ class Settings(BaseSettings):
     ENSEMBLE_SIZE: int = 5
     WALKFORWARD_FOLDS: int = 3
     # Comma-separated forward-return horizons (trading days) to train & serve.
-    # "5,20": 5d (timely) + 20d (stronger signal: clean-universe IC 0.021 vs
-    # 0.081). A deployment .env may override this.
-    PREDICTION_HORIZONS: str = "5,20"
+    # "5,20,30": 5d (timely) + 20d/30d (stronger signal — clean-universe + tuned
+    # reg: IC ~0.036 / 0.117 / 0.135). Longer horizons have higher signal-to-noise
+    # (60d overfits — negative fold — so it is excluded). A deployment .env may override.
+    PREDICTION_HORIZONS: str = "5,20,30"
     PREDICTION_UNIVERSE_SIZE: int = 500
     PREDICTION_MAX_STALE_DAYS: int = 5
     INFERENCE_MIN_COVERAGE: float = 0.5

@@ -222,11 +222,17 @@ MARKET_CONFIGS: dict[str, MarketConfig] = {
             # Dividend
             "SCHD", "VYM", "VIG", "DGRO", "DVY",
         }),
+        # Regularization tuned via fixed-seed A/B reg sweep (inverted-U optimum).
+        # Tighter than the original loose default; lifted RANKING IC ~+9% on the
+        # usable horizons (20d 0.107->0.117, 30d 0.125->0.135) with a more robust
+        # recent fold. Ranking-only: direction uses direction_lgb_overrides below.
         lgb_overrides={
             "learning_rate": 0.01,
-            "num_leaves": 31,
-            "min_child_samples": 30,
-            "lambda_l2": 1.0,
+            "num_leaves": 23,
+            "min_child_samples": 45,
+            "lambda_l2": 2.5,
+            "feature_fraction": 0.6,
+            "bagging_fraction": 0.75,
         },
         num_boost_round=1000,
         early_stopping_rounds=100,
