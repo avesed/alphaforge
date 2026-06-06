@@ -53,6 +53,7 @@ from app.services.feature_service import (
 from app.services.market_config import MarketConfig, get_market_config
 from app.services.prediction_store import deterministic_model_id, prediction_store
 from app.services.stockpulse_client import get_stockpulse_async_client
+from app.utils.cpu import get_ml_threads
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,9 @@ def _get_lgb_params(market: str, cfg: MarketConfig | None = None) -> dict[str, A
     params = dict(_BASE_LGB_PARAMS)
     resolved = cfg or get_market_config(market)
     params.update(resolved.lgb_overrides)
+    # Pin LightGBM/OpenMP threads to the cgroup CPU quota (avoids
+    # oversubscribing a CPU-limited container, which reads host nproc).
+    params["num_threads"] = get_ml_threads()
     return params
 
 

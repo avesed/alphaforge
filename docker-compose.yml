@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:16
+    restart: unless-stopped
     ports:
       - "5434:5432"
     environment:
@@ -17,6 +18,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     ports:
       - "6381:6379"
     command: redis-server --maxmemory 256mb --maxmemory-policy noeviction
@@ -30,6 +32,7 @@ services:
 
   app:
     build: .
+    restart: unless-stopped
     ports:
       - "8015:80"
     environment:
@@ -55,7 +58,7 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "4"
+          cpus: "16"
           memory: 12G
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8015/health"]

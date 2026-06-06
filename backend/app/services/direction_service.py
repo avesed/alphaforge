@@ -42,6 +42,7 @@ from app.services.market_features_service import (
     build_market_features,
 )
 from app.services.prediction_store import prediction_store
+from app.utils.cpu import get_ml_threads
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +120,9 @@ def _get_direction_lgb_params(
         if key in resolved.lgb_overrides:
             params[key] = resolved.lgb_overrides[key]
     params.update(resolved.direction_lgb_overrides)
+    # Pin LightGBM/OpenMP threads to the cgroup CPU quota (avoids
+    # oversubscribing a CPU-limited container, which reads host nproc).
+    params["num_threads"] = get_ml_threads()
     return params
 
 
