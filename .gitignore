@@ -14,3 +14,6 @@ frontend/dist/
 !frontend/src/**/*.d.ts
 frontend/vitest.config.js
 CLAUDE.md
+
+# ad-hoc ML 实验/验证脚本(A/B、forward-test、smoke 等,不入库)
+backend/_*.py
