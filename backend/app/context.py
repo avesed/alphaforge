@@ -12,6 +12,8 @@ import os
 import threading
 from typing import Optional
 
+from app.utils.cpu import get_ml_threads
+
 logger = logging.getLogger(__name__)
 
 
@@ -91,7 +93,17 @@ class QlibContext:
             try:
                 import qlib
 
-                qlib.init(provider_uri=provider_uri, region=region)
+                # kernels pins qlib's expression-engine worker pool to the
+                # cgroup CPU quota (default is host nproc -> oversubscription).
+                # NOTE: this is only half the fix -- qlib's joblib workers are
+                # separate processes whose own BLAS/OpenMP threads are capped by
+                # the OMP/OPENBLAS/MKL env the entrypoint exports. Both layers
+                # are required; do not drop the entrypoint env exports.
+                qlib.init(
+                    provider_uri=provider_uri,
+                    region=region,
+                    kernels=get_ml_threads(),
+                )
                 cls._current_region = region
                 cls._current_provider_uri = provider_uri
                 cls._initialized = True

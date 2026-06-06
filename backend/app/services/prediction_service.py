@@ -53,6 +53,7 @@ from app.services.feature_service import (
 from app.services.market_config import MarketConfig, get_market_config
 from app.services.prediction_store import deterministic_model_id, prediction_store
 from app.services.stockpulse_client import get_stockpulse_async_client
+from app.utils.cpu import get_ml_threads
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,9 @@ def _get_lgb_params(market: str, cfg: MarketConfig | None = None) -> dict[str, A
     params = dict(_BASE_LGB_PARAMS)
     resolved = cfg or get_market_config(market)
     params.update(resolved.lgb_overrides)
+    # Pin LightGBM/OpenMP threads to the cgroup CPU quota (avoids
+    # oversubscribing a CPU-limited container, which reads host nproc).
+    params["num_threads"] = get_ml_threads()
     return params
 
 
@@ -176,6 +180,34 @@ def _ranking_model_filename(forward_days: int) -> str:
     Other horizons use ``model.{forward_days}d.pkl``.
     """
     return "model.pkl" if forward_days == 5 else f"model.{forward_days}d.pkl"
+
+
+def _ranking_features_filename(forward_days: int) -> str:
+    """Per-horizon ranking feature-list filename within a date directory.
+
+    Mirrors ``_ranking_model_filename`` / ``_direction_features_filename``:
+    horizons share the ``{market}/{date}/`` dir, so the feature list must be
+    keyed on ``forward_days`` -- otherwise the last horizon trained overwrites
+    ``features.json`` for the others, and with feature selection ON each horizon
+    selects a DIFFERENT subset, causing a silent positional mismatch at serving.
+
+    The 5d horizon keeps the legacy ``features.json`` name so already-deployed
+    5d models keep working with zero migration; other horizons use
+    ``features.{forward_days}d.json``.
+    """
+    return "features.json" if forward_days == 5 else f"features.{forward_days}d.json"
+
+
+def _ranking_train_dist_filename(forward_days: int) -> str:
+    """Per-horizon PSI training-distribution filename within a date directory.
+
+    Same horizon-keying rationale as ``_ranking_features_filename``; 5d keeps the
+    legacy ``train_distribution.json`` name for zero-migration backward compat.
+    """
+    return (
+        "train_distribution.json" if forward_days == 5
+        else f"train_distribution.{forward_days}d.json"
+    )
 
 
 def _quality_marker_name(model_type: str, forward_days: int) -> str:
@@ -538,6 +570,22 @@ class PredictionService:
     # Public API: predictions query (via StockPulse)
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _resolve_default_horizon() -> int:
+        """The horizon served when a caller does not specify forward_days.
+
+        DEFAULT_TRADE_HORIZON (30d) if it is among the trained horizons, else the
+        largest trained horizon, else the configured value. 30d is preferred over
+        5d: highest decile spread and ~6x lower turnover (5d is net-negative after
+        cost). Used so the cache-miss / store-fallback path serves a single
+        deterministic horizon instead of a 5d/20d/30d-mixed ranking.
+        """
+        s = get_settings()
+        trained = _get_prediction_horizons()
+        if s.DEFAULT_TRADE_HORIZON in trained:
+            return s.DEFAULT_TRADE_HORIZON
+        return max(trained) if trained else s.DEFAULT_TRADE_HORIZON
+
     async def get_latest_predictions(
         self,
         market: str,
@@ -545,17 +593,26 @@ class PredictionService:
         symbol: Optional[str] = None,
         forward_days: Optional[int] = None,
     ) -> list[dict]:
-        # 1. Try Redis cache (only when no filters applied)
+        # Resolve the default served horizon up front so the cache-miss / store
+        # path serves a single horizon, not a forward_days=None mixed ranking.
+        resolved_fd = (
+            forward_days if forward_days is not None else self._resolve_default_horizon()
+        )
+
+        # 1. Try Redis cache (only for the default, unfiltered request -- the
+        # per-market cache is refreshed to the default horizon by
+        # _refresh_prediction_cache, so a hit already holds the default).
         if symbol is None and forward_days is None:
             cached = await self._read_prediction_cache(market)
             if cached is not None:
                 logger.debug("Prediction cache hit: market=%s", market)
                 return cached[:top_n]
 
-        # 2. Query via local PredictionStore
+        # 2. Query via local PredictionStore with the RESOLVED horizon (never
+        # None -> never a 5d/20d/30d-mixed result on cache miss).
         try:
             return await prediction_store.get_latest_predictions(
-                market, top_n, symbol=symbol, forward_days=forward_days,
+                market, top_n, symbol=symbol, forward_days=resolved_fd,
             )
         except Exception as e:
             logger.error("Failed to query latest predictions: %s", e)
@@ -1487,6 +1544,13 @@ class PredictionService:
             logger.warning("ML agent config failed, using defaults: %s", e)
             cfg = get_market_config(market)
 
+        # Preserve the RAW (winsorized, NOT sector-neutral) forward return for
+        # the net-cost gate's economic spread. forward_return is overwritten
+        # in-place by the sector-neutral demean below (US) -- a training LABEL
+        # transform, not tradeable P&L. The gate nets a RAW bps cost against the
+        # spread, so the spread must be in raw return units too (same basis).
+        df["raw_forward_return"] = df["forward_return"]
+
         # Sector-neutral labels
         if cfg.use_sector_neutral_labels:
             try:
@@ -1531,7 +1595,7 @@ class PredictionService:
         unique_dates = sorted(df["date"].unique())
         sort_cols = ["symbol", "date"] if cfg.use_temporal_sort else ["date", "symbol"]
 
-        meta_cols = {"symbol", "date", "close", "forward_return", "label"}
+        meta_cols = {"symbol", "date", "close", "forward_return", "raw_forward_return", "label"}
         feature_cols = [c for c in df.columns if c not in meta_cols]
         if not feature_cols:
             raise RuntimeError("No feature columns found")
@@ -1546,8 +1610,23 @@ class PredictionService:
         if not splits:
             raise RuntimeError("Could not generate walk-forward splits")
 
+        # Leakage-safe feature selection (flag-gated; default OFF). Computed
+        # ONLY on the first fold's training dates -- a strict prefix that ends
+        # forward_days before the earliest validation date, so it never sees any
+        # walk-forward validation window. Reducing feature_cols here (before the
+        # fold loop) makes every downstream consumer (datasets, importance, PSI,
+        # _save_model) follow automatically.
+        feature_cols, selection_diag = self._maybe_select_features(
+            df, feature_cols, splits, market, cfg,
+        )
+
         fold_ics: list[float] = []
         fold_icirs: list[float] = []
+        # Per-fold gross quintile spread + rebalance turnover for the net-of-cost
+        # quality gate (computed from each fold's own validation rows + realized
+        # forward_return -- leakage-safe).
+        fold_gross_spreads: list[float] = []
+        fold_turnovers: list[float] = []
         # Per-date IC series for each fold. Walk-forward validation windows are
         # non-overlapping (see _walk_forward_splits / _evaluate_quality_gate
         # docstring), so these can be pooled into one distribution for the
@@ -1593,7 +1672,18 @@ class PredictionService:
             fold_icirs.append(fold_icir)
             all_daily_ics.append(fold_ic_series)
 
-            logger.info("  Fold %d IC=%.4f, ICIR=%.4f", fold_idx + 1, fold_ic, fold_icir)
+            # Gate spread uses RAW returns (va_actual is sector-neutral for US,
+            # a label transform -- not tradeable P&L; cost is in raw bps).
+            fold_gross, fold_turnover, _ = self._compute_fold_spread_turnover(
+                va_df, va_scores, va_df["raw_forward_return"].values, forward_days,
+            )
+            fold_gross_spreads.append(fold_gross)
+            fold_turnovers.append(fold_turnover)
+
+            logger.info(
+                "  Fold %d IC=%.4f, ICIR=%.4f, gross_spread=%.4f, turnover=%.3f",
+                fold_idx + 1, fold_ic, fold_icir, fold_gross, fold_turnover,
+            )
 
             if is_final_fold:
                 final_models = models
@@ -1630,6 +1720,9 @@ class PredictionService:
         # flag is true the significance gate becomes binding.
         quality_passed, gate_metrics = self._evaluate_quality_gate(
             fold_ics, fold_icirs, all_daily_ics, cfg,
+            fold_gross_spreads=fold_gross_spreads,
+            fold_turnovers=fold_turnovers,
+            forward_days=forward_days,
         )
 
         if not quality_passed:
@@ -1648,6 +1741,8 @@ class PredictionService:
 
         # Always emit the significance-gate shadow verdict for calibration.
         self._log_significance_shadow(market, forward_days, fold_ics, gate_metrics, cfg)
+        # Net-of-cost gate one-line summary (shadow or enforced).
+        self._log_net_cost_gate(market, forward_days, gate_metrics)
 
         # Feature importance
         feature_importance: dict[str, float] = {}
@@ -1670,6 +1765,7 @@ class PredictionService:
         model_path = self._save_model(
             models, market, model_date, feature_cols, feature_importance,
             model_type="ranking", forward_days=forward_days,
+            selection_diag=selection_diag,
         )
 
         # Rewrite the on-disk quality marker now that the gate has decided.
@@ -1684,6 +1780,7 @@ class PredictionService:
         try:
             self._save_train_distribution(
                 final_train_df, feature_cols, os.path.dirname(model_path),
+                forward_days=forward_days,
             )
         except Exception as e:
             logger.warning("Failed to save training distribution: %s", e)
@@ -1734,6 +1831,14 @@ class PredictionService:
                 "significance_gate_passed": gate_metrics["significance_passed"],
                 "legacy_gate_passed": gate_metrics["legacy_passed"],
                 "significance_gate_enforced": gate_metrics["enforce_significance"],
+                # Net-of-cost / turnover gate diagnostics (shadow or enforced).
+                "mean_gross_spread": round(gate_metrics["mean_gross_spread"], 6),
+                "mean_turnover": round(gate_metrics["mean_turnover"], 6),
+                "mean_net_spread": round(gate_metrics["mean_net_spread"], 6),
+                "net_cost_gate_passed": gate_metrics["net_cost_passed"],
+                "net_cost_gate_enabled": gate_metrics["net_cost_gate_enabled"],
+                "fold_gross_spreads": [round(s, 6) for s in fold_gross_spreads],
+                "fold_turnovers": [round(t, 6) for t in fold_turnovers],
             },
         )
 
@@ -1788,6 +1893,10 @@ class PredictionService:
             lambda x: x.clip(x.quantile(0.01), x.quantile(0.99))
         )
 
+        # Preserve RAW (winsorized, non-sector-neutral) return for the net-cost
+        # gate spread -- same basis as the raw bps cost (see _train_model).
+        df["raw_forward_return"] = df["forward_return"]
+
         if config.use_sector_neutral_labels:
             try:
                 client = await get_stockpulse_async_client()
@@ -1828,7 +1937,7 @@ class PredictionService:
         unique_dates = sorted(df["date"].unique())
         sort_cols = ["symbol", "date"] if config.use_temporal_sort else ["date", "symbol"]
 
-        meta_cols = {"symbol", "date", "close", "forward_return", "label"}
+        meta_cols = {"symbol", "date", "close", "forward_return", "raw_forward_return", "label"}
         feature_cols = [c for c in df.columns if c not in meta_cols]
         if not feature_cols:
             raise RuntimeError("No feature columns found for backtest")
@@ -1842,8 +1951,19 @@ class PredictionService:
         if not splits:
             raise RuntimeError("Could not generate walk-forward splits for backtest")
 
+        # Leakage-safe feature selection (flag-gated; default OFF). Same first-
+        # fold-training-window restriction as the production path -- see
+        # _maybe_select_features. config carries the per-market thresholds.
+        feature_cols, selection_diag = self._maybe_select_features(
+            df, feature_cols, splits, market, config,
+        )
+
         fold_ics: list[float] = []
         fold_icirs: list[float] = []
+        # Per-fold gross spread + rebalance turnover (net-cost gate, same as the
+        # production path -- shared helper so the two cannot drift).
+        fold_gross_spreads: list[float] = []
+        fold_turnovers: list[float] = []
         # Per-date IC series per fold (non-overlapping windows -> poolable).
         all_daily_ics: list[pd.Series] = []
         final_models: list[lgb.Booster] = []
@@ -1871,12 +1991,21 @@ class PredictionService:
             )
 
             va_scores = np.mean([m.predict(X_va) for m in models], axis=0)
+            va_actual = va_df["forward_return"].values
             fold_ic_series, fold_ic, fold_icir = self._compute_ic_metrics(
-                va_df, va_scores, va_df["forward_return"].values,
+                va_df, va_scores, va_actual,
             )
             fold_ics.append(fold_ic)
             fold_icirs.append(fold_icir)
             all_daily_ics.append(fold_ic_series)
+
+            # Gate spread uses RAW returns (va_actual is sector-neutral for US,
+            # a label transform -- not tradeable P&L; cost is in raw bps).
+            fold_gross, fold_turnover, _ = self._compute_fold_spread_turnover(
+                va_df, va_scores, va_df["raw_forward_return"].values, forward_days,
+            )
+            fold_gross_spreads.append(fold_gross)
+            fold_turnovers.append(fold_turnover)
 
             if is_final_fold:
                 final_models = models
@@ -1914,10 +2043,15 @@ class PredictionService:
 
         # Shared quality-gate helper (same logic as production _train_model)
         # to prevent the two paths drifting. config is the per-market
-        # MarketConfig (may carry backtest overrides).
+        # MarketConfig (may carry backtest overrides). Thread gross spread +
+        # turnover so the net-cost gate matches the production path.
         quality_passed, gate_metrics = self._evaluate_quality_gate(
             fold_ics, fold_icirs, all_daily_ics, config,
+            fold_gross_spreads=fold_gross_spreads,
+            fold_turnovers=fold_turnovers,
+            forward_days=forward_days,
         )
+        self._log_net_cost_gate(market, forward_days, gate_metrics)
 
         return {
             "models": final_models,
@@ -1934,10 +2068,83 @@ class PredictionService:
             "t_stat": gate_metrics["t_stat"],
             "n_validation_dates": gate_metrics["n_validation_dates"],
             "min_fold_ic": gate_metrics["min_fold_ic"],
+            "mean_gross_spread": gate_metrics["mean_gross_spread"],
+            "mean_turnover": gate_metrics["mean_turnover"],
+            "mean_net_spread": gate_metrics["mean_net_spread"],
+            "net_cost_gate_passed": gate_metrics["net_cost_passed"],
+            "net_cost_gate_enabled": gate_metrics["net_cost_gate_enabled"],
             "ensemble_size": ensemble_size,
             "symbol_count": df["symbol"].nunique(),
             "feature_count": len(feature_cols),
+            "selection_diag": selection_diag,
         }
+
+    @staticmethod
+    def _maybe_select_features(
+        df: pd.DataFrame,
+        feature_cols: list[str],
+        splits: list[tuple[list, list]],
+        market: str,
+        cfg: MarketConfig,
+    ) -> tuple[list[str], dict | None]:
+        """Run leakage-safe feature selection when both flags are enabled.
+
+        Feature selection is applied to the RANKING model ONLY by design; the
+        direction classifier keeps its full feature set and persists its own
+        per-horizon ``direction_features.{fd}d.json`` independently.
+
+        Selection is computed ONLY on ``splits[0][0]`` -- the first walk-forward
+        fold's TRAINING dates. With expanding-window splits this is a strict
+        prefix that ends ``forward_days`` before the earliest validation date,
+        so it never overlaps ANY validation fold. Computing IC/correlation on
+        the full df would leak validation folds into selection and falsely
+        inflate walk-forward IC -- the exact failure mode we must avoid.
+
+        Returns ``(feature_cols, diagnostics)``. ``diagnostics`` is the
+        selection record (kept/input/dropped_*/corr_threshold/min_abs_ic) when
+        selection ran, else ``None``. No-op (returns the input unchanged, diag
+        None) when the flag is off, splits are empty, or the selection window
+        has too few unique dates.
+        """
+        settings = get_settings()
+        if not (settings.FEATURE_SELECTION_ENABLED and cfg.use_feature_selection):
+            return feature_cols, None
+
+        if not splits:
+            logger.warning("Feature selection skipped: no walk-forward splits")
+            return feature_cols, None
+
+        selection_dates = set(splits[0][0])
+        sel_df = df[df["date"].isin(selection_dates)]
+        n_dates = sel_df["date"].nunique()
+        if n_dates < 20:
+            logger.warning(
+                "Feature selection skipped: only %d selection dates (<20)",
+                n_dates,
+            )
+            return feature_cols, None
+
+        selected, diag = feature_service.select_features(
+            sel_df,
+            feature_cols,
+            label_col="forward_return",
+            corr_threshold=cfg.feature_selection_corr_threshold,
+            min_abs_ic=cfg.feature_selection_min_abs_ic,
+        )
+
+        dropped = diag.get("dropped_redundant", []) + diag.get("dropped_low_ic", [])
+        logger.info(
+            "Feature selection [%s]: kept %d/%d (dropped %d redundant, %d low-IC) "
+            "on %d selection dates; dropped=%s",
+            market,
+            len(selected),
+            len(feature_cols),
+            len(diag.get("dropped_redundant", [])),
+            len(diag.get("dropped_low_ic", [])),
+            n_dates,
+            dropped[:15] if len(dropped) <= 15 else f"{dropped[:15]} (+{len(dropped) - 15} more)",
+        )
+        return selected, diag
 
     @staticmethod
     def _walk_forward_splits(
@@ -2036,11 +2243,110 @@ class PredictionService:
         return ic_per_date, ic_mean, icir
 
     @staticmethod
+    def _compute_fold_spread_turnover(
+        val_df: pd.DataFrame,
+        predicted_scores: np.ndarray,
+        actual_returns: np.ndarray,
+        forward_days: int,
+    ) -> tuple[float, float, int]:
+        """Gross quintile spread + rebalance turnover for ONE validation fold.
+
+        Shared by ``_train_model`` and ``train_for_backtest`` so the net-cost
+        gate cannot drift between the two paths. Uses ONLY the validation
+        fold's own dates and its realized ``forward_return`` label (already the
+        ``forward_days``-ahead return used for training), so it is leakage-safe.
+
+        Quintile bucketing matches ``ml_backtest_service._compute_validation_metrics``
+        (``pd.qcut(score.rank(method="first"), q=5, labels=[1..5])`` per date,
+        Q5 = best predicted, Q1 = worst), but the spread is averaged PER-DATE (not
+        pooled across all rows) and uses the RAW return the caller supplies as
+        ``actual_returns`` -- the net-cost gate passes ``raw_forward_return``, NOT
+        the sector-neutral training label, so spread units match the bps cost.
+
+        Returns ``(gross_spread, turnover_per_rebalance, n_rebalances)``:
+          * gross_spread -- mean over validation dates of
+            (mean realized return of Q5) - (mean realized return of Q1).
+          * turnover_per_rebalance -- average fraction of names REPLACED in the
+            long (Q5) and short (Q1) baskets between consecutive REBALANCE dates,
+            rebalancing every ``forward_days`` trading dates (NOT daily). For each
+            consecutive rebalance pair: ``1 - |kept| / |basket|``, averaged over
+            the long and short legs and over all rebalance transitions. 0.0 when
+            there is fewer than one transition.
+          * n_rebalances -- number of rebalance transitions used for turnover
+            (0 when undefined).
+        """
+        if val_df.empty or len(predicted_scores) == 0:
+            return 0.0, 0.0, 0
+
+        tmp = val_df[["date", "symbol"]].copy()
+        tmp["pred"] = predicted_scores
+        tmp["actual"] = actual_returns
+        tmp = tmp.dropna(subset=["actual", "pred"])
+        if tmp.empty:
+            return 0.0, 0.0, 0
+
+        # Per-date quintiles (need >= 5 names/date to form 5 buckets).
+        def _q(x: "pd.Series") -> "pd.Series":
+            if len(x) < 5:
+                return pd.Series([np.nan] * len(x), index=x.index)
+            return pd.qcut(
+                x.rank(method="first"), q=5, labels=[1, 2, 3, 4, 5]
+            )
+
+        tmp["quintile"] = tmp.groupby("date")["pred"].transform(_q)
+        tmp = tmp.dropna(subset=["quintile"])
+        if tmp.empty:
+            return 0.0, 0.0, 0
+        tmp["quintile"] = tmp["quintile"].astype(int)
+
+        # --- Gross spread: per-date (Q5 mean - Q1 mean), averaged over dates ---
+        per_date = tmp.groupby(["date", "quintile"])["actual"].mean().unstack("quintile")
+        if 5 in per_date.columns and 1 in per_date.columns:
+            date_spread = (per_date[5] - per_date[1]).dropna()
+            gross_spread = float(date_spread.mean()) if len(date_spread) > 0 else 0.0
+        else:
+            gross_spread = 0.0
+
+        # --- Turnover at the rebalance cadence (every forward_days dates) ---
+        ordered_dates = sorted(tmp["date"].unique())
+        step = max(1, int(forward_days))
+        rebalance_dates = ordered_dates[::step]
+
+        # Basket membership (set of symbols) per rebalance date for each leg.
+        def _leg_sets(q_val: int) -> list[set]:
+            sets: list[set] = []
+            for d in rebalance_dates:
+                names = set(
+                    tmp[(tmp["date"] == d) & (tmp["quintile"] == q_val)]["symbol"]
+                )
+                sets.append(names)
+            return sets
+
+        long_sets = _leg_sets(5)
+        short_sets = _leg_sets(1)
+
+        leg_turnovers: list[float] = []
+        for sets in (long_sets, short_sets):
+            for i in range(1, len(sets)):
+                prev, cur = sets[i - 1], sets[i]
+                if not cur or not prev:
+                    continue
+                kept = len(cur & prev)
+                leg_turnovers.append(1.0 - kept / len(cur))
+
+        n_rebalances = max(0, len(rebalance_dates) - 1)
+        turnover = float(np.mean(leg_turnovers)) if leg_turnovers else 0.0
+        return gross_spread, turnover, n_rebalances
+
+    @staticmethod
     def _evaluate_quality_gate(
         fold_ics: list[float],
         fold_icirs: list[float],
         all_daily_ics: list["pd.Series"],
         cfg: MarketConfig,
+        fold_gross_spreads: list[float] | None = None,
+        fold_turnovers: list[float] | None = None,
+        forward_days: int = 0,
     ) -> tuple[bool, dict[str, Any]]:
         """Evaluate both the legacy and the significance quality gates.
 
@@ -2066,7 +2372,17 @@ class PredictionService:
             pooled_ic_mean, pooled_icir, t_stat, n_validation_dates,
             min_fold_ic, daily_ics (list[float], per-date IC pooled across
             folds -- persisted per decision 8), legacy_passed,
-            significance_passed, enforce_significance.
+            significance_passed, enforce_significance,
+            mean_gross_spread, mean_turnover, mean_net_spread,
+            net_cost_gate_enabled, net_cost_passed.
+
+        Net-cost gate (flag-gated by NET_COST_GATE_ENABLED, default OFF):
+        ``mean_net_spread = mean_gross_spread - mean_turnover * 2 * cost`` where
+        ``cost = TRADING_COST_BPS_ONEWAY / 10000`` (the 2x is the round trip:
+        exit old + enter new). When enabled, ``mean_net_spread > 0`` is AND-ed
+        onto the binding decision. When disabled the net metrics are computed,
+        returned, and logged but do NOT affect ``passed`` (SHADOW), so default-OFF
+        is byte-identical to the prior behavior.
         """
         settings = get_settings()
         enforce = settings.QUALITY_GATE_ENFORCE_SIGNIFICANCE
@@ -2115,7 +2431,51 @@ class PredictionService:
             and t_stat >= cfg.min_t_stat
         )
 
-        passed = significance_passed if enforce else legacy_passed
+        base_passed = significance_passed if enforce else legacy_passed
+
+        # --- Net-of-cost / turnover gate (flag-gated, default SHADOW) ---
+        # Aggregate the per-fold gross spread + turnover into fold means, then
+        # convert to a turnover-adjusted (net) spread on the same per-rebalance
+        # basis. When the flag is OFF these are computed and returned but do NOT
+        # alter the binding decision, so default-OFF is byte-identical.
+        net_cost_enabled = bool(settings.NET_COST_GATE_ENABLED)
+        cost_oneway = float(settings.TRADING_COST_BPS_ONEWAY) / 10000.0
+        if fold_gross_spreads:
+            mean_gross_spread = float(np.mean(fold_gross_spreads))
+        else:
+            mean_gross_spread = 0.0
+        if fold_turnovers:
+            mean_turnover = float(np.mean(fold_turnovers))
+        else:
+            mean_turnover = 0.0
+        # Cost drag per rebalance = 4 x turnover x one-way cost. The 4 = two
+        # legs (long Q5 + short Q1) x round-trip (exit replaced names + enter new
+        # ones). mean_turnover is the AVERAGE one-way replacement fraction across
+        # the two legs, so (f_long + f_short) = 2 x mean_turnover, and round-trip
+        # doubles that again: cost x 2(round-trip) x 2(legs) x mean_turnover.
+        mean_net_spread = mean_gross_spread - mean_turnover * 4.0 * cost_oneway
+
+        # Annualize to a calendar-comparable basis so rebalance FREQUENCY is
+        # penalized: a 5d model rebalances ~252/5 times/yr vs ~252/30 for 30d, so
+        # the same per-rebalance turnover is far costlier annually. annual_net has
+        # the SAME SIGN as the per-rebalance net (so it doesn't change the net>0
+        # test); its value is the cross-horizon comparison + the turnover ceiling.
+        ann_factor = (
+            settings.TRADING_DAYS_PER_YEAR / max(1, int(forward_days))
+            if forward_days else 0.0
+        )
+        annual_net_spread = mean_net_spread * ann_factor
+        annual_turnover = mean_turnover * ann_factor
+        # Turnover ceiling: reject churny models on an ANNUAL basis (the real 5d
+        # penalty). Default MAX_ANNUAL_TURNOVER is high (effectively off) -- opt
+        # in by lowering it after inspecting the shadow annual_turnover logs.
+        turnover_ok = (ann_factor == 0.0) or (
+            annual_turnover <= float(settings.MAX_ANNUAL_TURNOVER)
+        )
+        net_cost_passed = bool(mean_net_spread > 0.0 and turnover_ok)
+
+        # Default-OFF must be a no-op: only AND the net requirement when enabled.
+        passed = bool(base_passed and net_cost_passed) if net_cost_enabled else base_passed
 
         metrics: dict[str, Any] = {
             "ic_mean": ic_mean,
@@ -2130,6 +2490,14 @@ class PredictionService:
             "legacy_passed": legacy_passed,
             "significance_passed": significance_passed,
             "enforce_significance": bool(enforce),
+            # Net-of-cost / turnover gate diagnostics (persisted + shadow-logged).
+            "mean_gross_spread": mean_gross_spread,
+            "mean_turnover": mean_turnover,
+            "mean_net_spread": mean_net_spread,
+            "annual_net_spread": annual_net_spread,
+            "annual_turnover": annual_turnover,
+            "net_cost_gate_enabled": net_cost_enabled,
+            "net_cost_passed": net_cost_passed,
         }
         return passed, metrics
 
@@ -2168,6 +2536,36 @@ class PredictionService:
         )
 
     @staticmethod
+    def _log_net_cost_gate(
+        market: str,
+        forward_days: int,
+        metrics: dict[str, Any],
+    ) -> None:
+        """One-line summary of the net-of-cost / turnover gate.
+
+        Reports gross spread, rebalance turnover, the turnover-adjusted net
+        spread, and whether the net-cost gate would (SHADOW) or did (ENFORCED)
+        reject. Harmless when the gate is disabled -- it is purely informational
+        in that case.
+        """
+        enabled = bool(metrics.get("net_cost_gate_enabled"))
+        net_passed = bool(metrics.get("net_cost_passed"))
+        logger.info(
+            "[net-cost-gate %s] market=%s fwd=%d would_reject=%s "
+            "gross_spread=%.4f turnover=%.3f net_spread=%.4f "
+            "annual_net=%.4f annual_turnover=%.2f",
+            "ENFORCED" if enabled else "SHADOW",
+            market,
+            forward_days,
+            "no" if net_passed else "yes",
+            metrics.get("mean_gross_spread", 0.0),
+            metrics.get("mean_turnover", 0.0),
+            metrics.get("mean_net_spread", 0.0),
+            metrics.get("annual_net_spread", 0.0),
+            metrics.get("annual_turnover", 0.0),
+        )
+
+    @staticmethod
     def _save_model(
         models: list[lgb.Booster] | lgb.Booster,
         market: str,
@@ -2176,6 +2574,7 @@ class PredictionService:
         feature_importance: dict[str, float] | None = None,
         model_type: str = "ranking",
         forward_days: int = 5,
+        selection_diag: dict | None = None,
     ) -> str:
         if isinstance(models, lgb.Booster):
             models = [models]
@@ -2195,8 +2594,12 @@ class PredictionService:
         }
         if feature_importance is not None:
             features_meta["feature_importance"] = feature_importance
+        # Persist what feature selection removed (best-effort; absent when
+        # selection didn't run, so default-OFF behavior is unchanged).
+        if selection_diag is not None:
+            features_meta["selection"] = selection_diag
 
-        features_path = str(model_dir / "features.json")
+        features_path = str(model_dir / _ranking_features_filename(forward_days))
         with open(features_path, "w") as f:
             json.dump(features_meta, f, default=_numpy_default)
 
@@ -2211,6 +2614,7 @@ class PredictionService:
     @staticmethod
     def _save_train_distribution(
         train_df: pd.DataFrame, feature_cols: list[str], model_dir: str,
+        forward_days: int = 5,
     ) -> None:
         dist: dict[str, list[float]] = {}
         percentiles = np.linspace(0, 100, 11).tolist()
@@ -2222,7 +2626,7 @@ class PredictionService:
                 continue
             dist[col] = [float(v) for v in np.percentile(vals, percentiles)]
 
-        path = os.path.join(model_dir, "train_distribution.json")
+        path = os.path.join(model_dir, _ranking_train_dist_filename(forward_days))
         with open(path, "w") as f:
             json.dump(dist, f, default=_numpy_default)
         logger.info("Saved training distribution snapshot: %d features", len(dist))
@@ -2230,8 +2634,15 @@ class PredictionService:
     @staticmethod
     def _compute_inference_psi(
         inference_df: pd.DataFrame, feature_cols: list[str], model_dir: str,
+        forward_days: int = 5,
     ) -> dict[str, float] | None:
-        dist_path = os.path.join(model_dir, "train_distribution.json")
+        dist_path = os.path.join(
+            model_dir, _ranking_train_dist_filename(forward_days),
+        )
+        # Backward-compat: fall back to the unkeyed legacy filename for old
+        # models and the selection-OFF case (all horizons shared the full set).
+        if not os.path.exists(dist_path):
+            dist_path = os.path.join(model_dir, "train_distribution.json")
         if not os.path.exists(dist_path):
             return None
         with open(dist_path) as f:
@@ -2355,8 +2766,15 @@ class PredictionService:
         loaded = await asyncio.to_thread(joblib.load, model_path)
         models = loaded if isinstance(loaded, list) else [loaded]
 
-        # Load feature names
-        features_path = os.path.join(os.path.dirname(model_path), "features.json")
+        # Load feature names. Read the horizon-keyed file first; fall back to
+        # the unkeyed legacy filename for old models and the selection-OFF case
+        # (where every horizon shared the identical full feature set).
+        model_basedir = os.path.dirname(model_path)
+        features_path = os.path.join(
+            model_basedir, _ranking_features_filename(forward_days),
+        )
+        if not os.path.exists(features_path):
+            features_path = os.path.join(model_basedir, "features.json")
 
         def _load_feature_meta() -> Optional[dict]:
             if not os.path.exists(features_path):
@@ -2421,7 +2839,9 @@ class PredictionService:
 
         # Feature drift detection
         model_dir = os.path.dirname(model_path)
-        psi_scores = self._compute_inference_psi(latest_df, feature_cols, model_dir)
+        psi_scores = self._compute_inference_psi(
+            latest_df, feature_cols, model_dir, forward_days,
+        )
         if psi_scores:
             high_drift = {k: v for k, v in psi_scores.items() if v > 0.2}
             moderate_drift = {k: v for k, v in psi_scores.items() if 0.1 < v <= 0.2}
@@ -2677,7 +3097,17 @@ class PredictionService:
     async def _refresh_prediction_cache(self, market: str) -> None:
         try:
             settings = get_settings()
-            default_horizon = int(settings.PREDICTION_HORIZONS.split(",")[0].strip())
+            # Serve the configured default trade horizon (30d by default --
+            # strongest spread / lowest turnover). Fall back to the largest
+            # trained horizon when DEFAULT_TRADE_HORIZON is not in the trained
+            # set, so this never crashes on a non-standard PREDICTION_HORIZONS.
+            trained_horizons = _get_prediction_horizons()
+            if settings.DEFAULT_TRADE_HORIZON in trained_horizons:
+                default_horizon = settings.DEFAULT_TRADE_HORIZON
+            elif trained_horizons:
+                default_horizon = max(trained_horizons)
+            else:
+                default_horizon = settings.DEFAULT_TRADE_HORIZON
             predictions = await prediction_store.get_latest_predictions(
                 market, 500, forward_days=default_horizon,
             )

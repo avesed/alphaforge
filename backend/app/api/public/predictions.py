@@ -145,6 +145,8 @@ async def get_feature_importance(
     import json
     import os
 
+    from app.services.prediction_service import _ranking_features_filename
+
     # Validate UUID format
     try:
         uuid.UUID(model_id)
@@ -186,7 +188,16 @@ async def get_feature_importance(
     full_importance = stored_importance
     model_path = model_row.get("file_path")
     if model_path and not full_importance:
-        features_path = os.path.join(os.path.dirname(model_path), "features.json")
+        # Read the horizon-keyed feature file first; fall back to the unkeyed
+        # legacy filename for old models / the selection-OFF case (all horizons
+        # shared the full set). Matches _run_inference's read path.
+        fwd = model_row.get("forward_days") or 5
+        model_basedir = os.path.dirname(model_path)
+        features_path = os.path.join(
+            model_basedir, _ranking_features_filename(fwd),
+        )
+        if not os.path.exists(features_path):
+            features_path = os.path.join(model_basedir, "features.json")
 
         def _read_features():
             if not os.path.exists(features_path):

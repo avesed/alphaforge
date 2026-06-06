@@ -57,6 +57,21 @@ class MarketConfig:
         Forward-fill limit (calendar days) for fundamental data.
         CN=90: quarterly reporting cycle ~90 days.
         US/HK=45: more frequent data updates.
+    use_feature_selection : bool
+        True  -> run the leakage-safe feature-selection stage before the
+                 walk-forward fold loop (drops redundant / low-IC features).
+        False -> keep the full feature universe (default for all markets).
+        Only takes effect when the global ``FEATURE_SELECTION_ENABLED`` setting
+        is also true; both flags must agree for selection to run. Selection is
+        computed ONLY on the first walk-forward fold's training window (a strict
+        prefix that never overlaps any validation fold) to avoid leakage.
+    feature_selection_corr_threshold : float
+        Absolute pairwise-correlation threshold for the de-redundancy step.
+        A feature is dropped when it correlates above this with an
+        already-kept, higher-|IC| feature. 0.95 keeps all but near-duplicates.
+    feature_selection_min_abs_ic : float
+        Conservative IC floor: features with ``abs(mean_ic)`` below this are
+        dropped. Default 0.0 -> no IC-based dropping (de-redundancy only).
 
     Universe filtering
     ------------------
@@ -154,6 +169,11 @@ class MarketConfig:
     use_interactions: bool
     nan_threshold: float
     ffill_limit: int
+    # Feature selection (noise reduction). Defaults keep every market at the
+    # current behavior (no selection); enable per-market only after an A/B test.
+    use_feature_selection: bool = False
+    feature_selection_corr_threshold: float = 0.95
+    feature_selection_min_abs_ic: float = 0.0
     # Universe filtering (hand-curated; StockPulse stock_type is unpopulated)
     excluded_symbols: frozenset[str] = frozenset()
     # Market-level features
