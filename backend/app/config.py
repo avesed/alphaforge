@@ -83,6 +83,34 @@ class Settings(BaseSettings):
     # trained horizon (never crashes).
     DEFAULT_TRADE_HORIZON: int = 30
     PREDICTION_UNIVERSE_SIZE: int = 500
+
+    # Short-interest feature mode (US-only block). "naive" preserves the exact
+    # current behavior byte-for-byte: an exact (symbol, date) merge of EVERY
+    # short column (short_pct_float, short_ratio, shares_short,
+    # shares_short_prior, short_pct_shares_out) followed by a per-symbol
+    # forward-fill, no derived features, and no publication lag. "improved" is a
+    # point-in-time as-of merge: each reading is attached only from its (lagged)
+    # public date = stored date + PUBLICATION_LAG_BDAYS business days, restricted
+    # to an explicit whitelist plus a derived short_change squeeze feature (raw
+    # share-count size proxies are NOT carried in). "off" drops the short block
+    # entirely (no fetch, no columns).
+    #
+    # Default is "off": a 2026-06-06 US rolling-forward A/B (10 bi-monthly
+    # cutoffs, LGB OOS) found the short-interest signal NOISE-LEVEL. "improved"
+    # was the best of the three but beat "off" by only +0.004..0.013 mean IC
+    # (below the +0.02 bar, t-insignificant) and did NOT repair the 2025-02
+    # crash window; "naive" was even mildly HARMFUL at 20d/30d (leaked PIT + raw
+    # size-proxy cols). So the block is off by default. "naive"/"improved" are
+    # kept as configurable options (improved is strictly best if short data is
+    # ever worth re-enabling -- would require FINRA incremental feed first).
+    SHORT_INTEREST_MODE: str = "off"   # off | naive | improved
+    # Business-day lag applied to the stored short-interest date before the
+    # "improved" as-of merge. Upstream date semantics are MIXED: FINRA-backfilled
+    # rows store the SETTLEMENT date (public ~8 bdays later -> the lag is the
+    # true dissemination model), while ongoing yfinance rows store the COLLECTION
+    # date (already public -> the lag is a conservative safety buffer). The shift
+    # only ever moves data LATER, so it is leakage-safe in both cases.
+    SHORT_INTEREST_PUBLICATION_LAG_BDAYS: int = 8
     PREDICTION_MAX_STALE_DAYS: int = 5
     INFERENCE_MIN_COVERAGE: float = 0.5
     MODEL_RETENTION_DAYS: int = 90

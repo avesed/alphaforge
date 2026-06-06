@@ -121,6 +121,21 @@ INSIDER_FEATURES: list[str] = ["net_shares_pct", "insider_ownership_pct"]
 # Options put/call ratio (US only) — also serves as sentiment proxy
 OPTIONS_FEATURES: list[str] = ["put_call_ratio", "put_call_oi_ratio"]
 
+# Explicit short-interest whitelist used ONLY in "improved" mode
+# (SHORT_INTEREST_MODE="improved"). In "naive" mode every short column auto-
+# becomes a feature via the implicit feature_cols registration; this whitelist
+# intentionally restricts improved mode to a small, leakage-safe set:
+#   short_ratio:     days-to-cover (FINRA-provided).
+#   short_change:    derived squeeze feature = shares_short / shares_short_prior
+#                    - 1 (period-over-period change in short position).
+#   short_pct_float: stays listed for when float-bearing data returns. During
+#                    the FINRA-only period it is mostly NULL and is sparse-
+#                    dropped by the nan_threshold — that is fine.
+# Raw shares_short / shares_short_prior are intentionally NOT features in
+# improved mode (they are size proxies); they are used only to compute
+# short_change. short_pct_shares_out is likewise dropped.
+SHORT_INTEREST_FEATURES: list[str] = ["short_ratio", "short_change", "short_pct_float"]
+
 # Earnings calendar features
 EARNINGS_CALENDAR_FEATURES: list[str] = ["days_to_earnings"]
 
@@ -182,6 +197,11 @@ class FeatureService:
         if not symbols:
             logger.warning("build_feature_matrix called with empty symbol list")
             return pd.DataFrame()
+
+        # Short-interest feature mode (US-only block). "naive" (default) is
+        # byte-identical to legacy behavior; "improved" uses a point-in-time
+        # as-of merge with a publication lag; "off" skips the short block.
+        short_interest_mode = get_settings().SHORT_INTEREST_MODE.lower()
 
         logger.info(
             "Building feature matrix: market=%s, symbols=%d, %s~%s, "
@@ -279,8 +299,8 @@ class FeatureService:
         ))
         task_names.append("options")
 
-        # Short interest (US market only)
-        if market == "us":
+        # Short interest (US market only; skipped entirely when mode == "off")
+        if market == "us" and short_interest_mode != "off":
             tasks.append(asyncio.create_task(
                 self._safe_get_short_interest(symbols, start_date, end_date),
             ))
@@ -440,51 +460,147 @@ class FeatureService:
             logger.info("Merged options features: %d columns added (with forward-fill)", len(opt_cols) - 2)
 
         if not short_interest_df.empty:
-            short_interest_df["date"] = pd.to_datetime(short_interest_df["date"].astype(str).str[:10], errors="coerce")
-            si_cols = ["symbol", "date"] + [
-                c for c in short_interest_df.columns
-                if c not in ("symbol", "date")
-            ]
-            # Use fillna strategy: short_ratio/short_pct_float may already
-            # exist from fundamentals -- prefer existing non-null values.
-            si_new = short_interest_df[si_cols]
-            overlap_cols = [
-                c for c in si_new.columns
-                if c in merged.columns and c not in ("symbol", "date")
-            ]
-            if overlap_cols:
-                si_unique = [
-                    c for c in si_new.columns
-                    if c not in overlap_cols or c in ("symbol", "date")
-                ]
-                if len(si_unique) > 2:
-                    merged = merged.merge(
-                        si_new[si_unique], on=["symbol", "date"], how="left",
-                    )
-                # Fill NaN in existing columns from short interest data
-                si_fill = si_new[["symbol", "date"] + overlap_cols]
-                merged = merged.merge(
-                    si_fill, on=["symbol", "date"], how="left", suffixes=("", "_si"),
+            if short_interest_mode == "improved":
+                # Point-in-time as-of merge. Each reading is attached only from
+                # its public date + a business-day buffer, restricted to the
+                # whitelist + derived short_change. NEVER attaches a reading
+                # before its (lagged) public date.
+                #
+                # Date semantics are MIXED upstream: FINRA-backfilled rows store
+                # date = SETTLEMENT date (public ~8 bdays later, so the lag is
+                # the true dissemination model); ongoing yfinance rows store
+                # date = COLLECTION date (already public, so the lag is just a
+                # conservative safety buffer). Either way the shift only moves
+                # data LATER, so it is leakage-safe by construction.
+                import numpy as np
+                from pandas.tseries.offsets import BusinessDay
+
+                lag = get_settings().SHORT_INTEREST_PUBLICATION_LAG_BDAYS
+                si = short_interest_df.copy()
+                si["date"] = pd.to_datetime(
+                    si["date"].astype(str).str[:10], errors="coerce"
                 )
-                for col in overlap_cols:
-                    si_col = f"{col}_si"
-                    if si_col in merged.columns:
-                        merged[col] = merged[col].fillna(merged[si_col])
-                        merged = merged.drop(columns=[si_col])
+
+                # Derived squeeze feature: period-over-period change in short
+                # position. Defined only where shares_short_prior > 0; +/-inf
+                # and garbage clipped to a sane ordinal range.
+                if "shares_short" in si.columns and "shares_short_prior" in si.columns:
+                    prior = pd.to_numeric(si["shares_short_prior"], errors="coerce")
+                    curr = pd.to_numeric(si["shares_short"], errors="coerce")
+                    short_change = (curr / prior) - 1.0
+                    short_change = short_change.where(prior > 0)
+                    short_change = short_change.replace([np.inf, -np.inf], np.nan)
+                    short_change = short_change.clip(lower=-2.0, upper=2.0)
+                    si["short_change"] = short_change
+                else:
+                    si["short_change"] = np.nan
+
+                # Lagged public date = stored date + lag business days (true
+                # dissemination date for FINRA settlement-dated rows; a
+                # conservative buffer for already-public yfinance rows).
+                si["pub_date"] = si["date"] + BusinessDay(lag)
+
+                # Right frame: symbol, pub_date, and only the whitelist columns
+                # that exist. Raw share counts / short_pct_shares_out excluded.
+                si_feature_cols = [
+                    c for c in SHORT_INTEREST_FEATURES if c in si.columns
+                ]
+                si_right = si[["symbol", "pub_date"] + si_feature_cols].copy()
+                si_right = si_right.dropna(subset=["pub_date"]).sort_values(
+                    "pub_date"
+                ).reset_index(drop=True)
+
+                # merge_asof requires BOTH frames globally sorted by the on-key
+                # AND raises ValueError if the on-key contains NaT. Drop NaT-date
+                # rows on the left first (mirrors the PEAD grid convention at
+                # ~L1178); a NaT-date row cannot be per-date rank-transformed
+                # downstream anyway, so dropping it is safe. The right frame is
+                # already NaT-protected via dropna(subset=["pub_date"]) above.
+                merged_sorted = (
+                    merged.dropna(subset=["date"])
+                    .sort_values("date")
+                    .reset_index(drop=True)
+                )
+                merged = pd.merge_asof(
+                    merged_sorted,
+                    si_right,
+                    left_on="date",
+                    right_on="pub_date",
+                    by="symbol",
+                    direction="backward",
+                )
+                if "pub_date" in merged.columns:
+                    merged = merged.drop(columns=["pub_date"])
+
+                # NOTE: backward as-of already carries each symbol's last PUBLIC
+                # reading forward to every later date, so -- unlike naive mode --
+                # no explicit per-symbol groupby ffill is applied here (it would
+                # be redundant). Do not "restore" one.
+
+                # Restore canonical ordering for stable downstream groupby ops.
+                merged = merged.sort_values(["symbol", "date"]).reset_index(drop=True)
+
+                # Coverage diagnostics.
+                def _coverage(col: str) -> float:
+                    if col not in merged.columns or len(merged) == 0:
+                        return 0.0
+                    return float(merged[col].notna().mean())
+
+                logger.info(
+                    "Merged short interest features (improved, as-of +%d bdays): "
+                    "%d columns, coverage short_ratio=%.3f short_change=%.3f",
+                    lag, len(si_feature_cols),
+                    _coverage("short_ratio"), _coverage("short_change"),
+                )
             else:
-                merged = merged.merge(si_new, on=["symbol", "date"], how="left")
-            si_feature_cols = [
-                c for c in merged.columns
-                if c in short_interest_df.columns and c not in ("symbol", "date")
-            ]
-            if si_feature_cols:
-                merged = merged.sort_values(["symbol", "date"])
-                merged[si_feature_cols] = merged.groupby("symbol")[si_feature_cols].ffill()
-                merged = merged.reset_index(drop=True)
-            logger.info(
-                "Merged short interest features: %d columns (with forward-fill)",
-                len(si_cols) - 2,
-            )
+                # mode == "naive" (default) or any unexpected value: exact
+                # (symbol, date) merge of every short column + per-symbol ffill.
+                # Byte-identical legacy behavior -- do not alter.
+                short_interest_df["date"] = pd.to_datetime(short_interest_df["date"].astype(str).str[:10], errors="coerce")
+                si_cols = ["symbol", "date"] + [
+                    c for c in short_interest_df.columns
+                    if c not in ("symbol", "date")
+                ]
+                # Use fillna strategy: short_ratio/short_pct_float may already
+                # exist from fundamentals -- prefer existing non-null values.
+                si_new = short_interest_df[si_cols]
+                overlap_cols = [
+                    c for c in si_new.columns
+                    if c in merged.columns and c not in ("symbol", "date")
+                ]
+                if overlap_cols:
+                    si_unique = [
+                        c for c in si_new.columns
+                        if c not in overlap_cols or c in ("symbol", "date")
+                    ]
+                    if len(si_unique) > 2:
+                        merged = merged.merge(
+                            si_new[si_unique], on=["symbol", "date"], how="left",
+                        )
+                    # Fill NaN in existing columns from short interest data
+                    si_fill = si_new[["symbol", "date"] + overlap_cols]
+                    merged = merged.merge(
+                        si_fill, on=["symbol", "date"], how="left", suffixes=("", "_si"),
+                    )
+                    for col in overlap_cols:
+                        si_col = f"{col}_si"
+                        if si_col in merged.columns:
+                            merged[col] = merged[col].fillna(merged[si_col])
+                            merged = merged.drop(columns=[si_col])
+                else:
+                    merged = merged.merge(si_new, on=["symbol", "date"], how="left")
+                si_feature_cols = [
+                    c for c in merged.columns
+                    if c in short_interest_df.columns and c not in ("symbol", "date")
+                ]
+                if si_feature_cols:
+                    merged = merged.sort_values(["symbol", "date"])
+                    merged[si_feature_cols] = merged.groupby("symbol")[si_feature_cols].ffill()
+                    merged = merged.reset_index(drop=True)
+                logger.info(
+                    "Merged short interest features: %d columns (with forward-fill)",
+                    len(si_cols) - 2,
+                )
 
         if not earnings_calendar_df.empty:
             earnings_calendar_df["date"] = pd.to_datetime(
